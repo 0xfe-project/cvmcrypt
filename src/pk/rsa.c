@@ -268,65 +268,92 @@ bool cvmcrypt_rsa_verify_pss(CvmRsaKey const* key, CvmRsaHashId hash_id, u8 cons
         goto fail;
     }
 
-    /* The leftmost (8*em_len - n_bits) bits of the first byte must be 0. */
-    u8 mask_bits = (u8)((8 * em_len - n_bits) & 7);
-    if (mask_bits > 0) {
-        if ((em[0] >> (8 - mask_bits)) != 0) {
-            rt_mem_free(em);
-            goto fail;
-        }
-    }
+    /* RFC 8017 §9.1.2 EMSA-PSS-VERIFY:
+     * EM = maskedDB || H || 0xbc
+     * maskedDB is em[0 .. db_len-1], H is em[db_len .. db_len+hLen-1]. */
+    usize db_len = em_len - hashlen - 1;
 
-    /* Check the last byte's low byte: must end with 0xBC. */
+    /* Check the last byte: must be 0xbc. */
     if (em[em_len - 1] != 0xBC) {
         rt_mem_free(em);
         goto fail;
     }
 
-    /* Split EM: maskedSeed || DB. */
-    usize db_len = em_len - hashlen - 1;
-    u8* masked_seed = em;
-    u8* db = em + hashlen;
-
-    /* seed = maskedSeed XOR MGF(maskedDB). */
-    u8* mgf_mask = rt_mem_alloc(db_len);
-    if (mgf_mask == NULL) {
+    /* RFC 8017 §8.1.1: emBits = modBits - 1. The leftmost
+     * (8*em_len - emBits) bits of EM must be zero. */
+    u8 mask_bits = (u8)((8 * em_len - (n_bits - 1)) & 7);
+    if (mask_bits > 0 && (em[0] >> (8 - mask_bits)) != 0) {
         rt_mem_free(em);
         goto fail;
     }
-    mgf1(hash_id, db, db_len, mgf_mask, db_len);
-    u8 seed[64];
-    memcpy(seed, masked_seed, hashlen);
-    for (usize i = 0; i < hashlen; i++)
-        seed[i] ^= mgf_mask[i];
 
-    /* mgf_mask reused for the DB mask. */
-    mgf1(hash_id, seed, hashlen, mgf_mask, db_len);
+    /* dbMask = MGF1(H, db_len); DB = maskedDB XOR dbMask. */
+    u8* db_mask = rt_mem_alloc(db_len);
+    if (db_mask == NULL) {
+        rt_mem_free(em);
+        goto fail;
+    }
+    u8 const* h = em + db_len;
+    u8* db = em; /* in-place unmask */
+    mgf1(hash_id, h, hashlen, db_mask, db_len);
     for (usize i = 0; i < db_len; i++)
-        db[i] ^= mgf_mask[i];
+        db[i] ^= db_mask[i];
 
     /* Clear the leftmost mask_bits of DB[0]. */
-    if (mask_bits > 0) {
+    if (mask_bits > 0)
         db[0] &= (u8)((1 << (8 - mask_bits)) - 1);
-    }
 
-    /* Check DB = PS (zeros) || 0x01 || H. */
-    /* Find the 0x01 byte after the leading zeros. */
-    usize i = 0;
-    while (i < db_len && db[i] == 0x00)
-        i++;
-    if (i >= db_len || db[i] != 0x01) {
-        rt_mem_free(mgf_mask);
+    /* DB should be: PS (zeros) || 0x01 || salt. Find the 0x01. */
+    usize idx = 0;
+    while (idx < db_len && db[idx] == 0x00)
+        idx++;
+    if (idx >= db_len || db[idx] != 0x01) {
+        rt_mem_free(db_mask);
         rt_mem_free(em);
         goto fail;
     }
-    i++; /* skip the 0x01 */
+    idx++; /* skip the 0x01 */
 
-    /* The remaining bytes must equal the hash. */
-    usize remaining = db_len - i;
-    bool ok = (remaining == hashlen) && cvmcrypt_ct_eq(db + i, hash, hashlen);
+    /* salt = DB[idx .. db_len-1]. sLen = db_len - idx.
+     * Compute M' = 0x00*8 || mHash || salt, then H' = Hash(M'). */
+    usize salt_len = db_len - idx;
+    u8 const* salt = db + idx;
 
-    rt_mem_free(mgf_mask);
+    u8 m_prime[8 + 64 + 64]; /* 8 zero bits + max hash + max salt */
+    memset(m_prime, 0, 8);
+    memcpy(m_prime + 8, hash, hashlen);
+    memcpy(m_prime + 8 + hashlen, salt, salt_len);
+
+    u8 h_prime[64];
+    usize m_prime_len = 8 + hashlen + salt_len;
+    switch (hash_id) {
+    case CVMCRYPT_RSA_HASH_SHA256: {
+        CvmcryptSha256 ctx;
+        cvmcrypt_sha256_init(&ctx);
+        cvmcrypt_sha256_update(&ctx, m_prime, m_prime_len);
+        cvmcrypt_sha256_final(&ctx, h_prime);
+        break;
+    }
+    case CVMCRYPT_RSA_HASH_SHA384: {
+        CvmcryptSha512 ctx;
+        cvmcrypt_sha384_init(&ctx);
+        cvmcrypt_sha512_update(&ctx, m_prime, m_prime_len);
+        cvmcrypt_sha384_final(&ctx, h_prime);
+        break;
+    }
+    case CVMCRYPT_RSA_HASH_SHA512: {
+        CvmcryptSha512 ctx;
+        cvmcrypt_sha512_init(&ctx);
+        cvmcrypt_sha512_update(&ctx, m_prime, m_prime_len);
+        cvmcrypt_sha512_final(&ctx, h_prime);
+        break;
+    }
+    }
+
+    /* Valid iff H' == H. */
+    bool ok = cvmcrypt_ct_eq(h_prime, h, hashlen);
+
+    rt_mem_free(db_mask);
     rt_mem_free(em);
     cvmcrypt_mpi_free(&sig_mpi);
     cvmcrypt_mpi_free(&em_mpi);
