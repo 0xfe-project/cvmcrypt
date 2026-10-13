@@ -356,37 +356,55 @@ bool cvmcrypt_mpi_div_mpi(CvmMpi* Q, CvmMpi* R, CvmMpi const* A, CvmMpi const* B
         return true;
     }
 
-    /* Simple bit-by-bit long division. Not fast but correct. */
+    /* Simple bit-by-bit long division. Not fast but correct.
+     * Pre-allocates fixed buffers; no malloc/free inside the loop. */
     usize bits = cvmcrypt_mpi_bitlen(A);
+    usize b_limbs = B->n;
+    usize r_cap = b_limbs + 1; /* remainder ≤ 2*B after shift */
+    usize q_limbs = (bits + MPI_LIMB_BITS - 1) / MPI_LIMB_BITS;
+
     CvmMpi quotient, remainder;
     cvmcrypt_mpi_init(&quotient);
     cvmcrypt_mpi_init(&remainder);
 
-    if (!cvmcrypt_mpi_grow(&quotient, (bits + MPI_LIMB_BITS - 1) / MPI_LIMB_BITS))
+    if (!cvmcrypt_mpi_grow(&quotient, q_limbs ? q_limbs : 1))
         goto fail;
+    if (!cvmcrypt_mpi_grow(&remainder, r_cap))
+        goto fail;
+    memset(quotient.p, 0, quotient.n * sizeof(mpi_uint));
+    memset(remainder.p, 0, remainder.n * sizeof(mpi_uint));
+    remainder.n = 0;
 
     for (i32 i = (i32)bits - 1; i >= 0; i--) {
-        /* R = R << 1 | bit i of A */
-        if (!cvmcrypt_mpi_shift_l(&remainder, 1))
-            goto fail;
+        /* R = R << 1 | bit i of A — inline shift, no allocation. */
+        mpi_uint carry = 0;
+        for (usize j = 0; j < remainder.n; j++) {
+            mpi_uint next = remainder.p[j] >> (MPI_LIMB_BITS - 1);
+            remainder.p[j] = (remainder.p[j] << 1) | carry;
+            carry = next;
+        }
+        if (carry && remainder.n < r_cap) {
+            remainder.p[remainder.n] = carry;
+            remainder.n++;
+        }
         if (cvmcrypt_mpi_get_bit(A, (usize)i)) {
-            if (remainder.n == 0) {
-                if (!cvmcrypt_mpi_grow(&remainder, 1))
-                    goto fail;
-            }
+            if (remainder.n == 0)
+                remainder.n = 1;
             remainder.p[0] |= 1;
         }
-        /* If R >= B: R -= B, Q bit i = 1 */
+        /* If R >= B: R -= B in place, Q bit i = 1.
+         * Loop over r_cap limbs (buffer is pre-zeroed beyond remainder.n)
+         * so the borrow propagates into the extra limb when R > B. */
         if (cvmcrypt_mpi_cmp_abs(&remainder, B) >= 0) {
-            CvmMpi tmp;
-            cvmcrypt_mpi_init(&tmp);
-            if (!cvmcrypt_mpi_sub_abs(&tmp, &remainder, B)) {
-                cvmcrypt_mpi_free(&tmp);
-                goto fail;
+            mpi_uint borrow = 0;
+            for (usize j = 0; j < r_cap; j++) {
+                mpi_uint const bj = (j < B->n) ? B->p[j] : 0;
+                mpi_uint const aj = (j < remainder.n) ? remainder.p[j] : 0;
+                remainder.p[j] = aj - bj - borrow;
+                borrow = (aj < bj) || (aj == bj && borrow == 1);
             }
-            cvmcrypt_mpi_swap(&remainder, &tmp);
-            cvmcrypt_mpi_free(&tmp);
-            /* Set bit i in quotient. */
+            while (remainder.n > 0 && remainder.p[remainder.n - 1] == 0)
+                remainder.n--;
             quotient.p[i / MPI_LIMB_BITS] |= (mpi_uint)1 << (i % MPI_LIMB_BITS);
         }
     }
@@ -516,64 +534,124 @@ bool cvmcrypt_mpi_montmul(CvmMpi* X, CvmMpi const* A, CvmMpi const* B, CvmMpi co
 /* ------------------------------------------------------------------ */
 
 bool cvmcrypt_mpi_inv_mod(CvmMpi* X, CvmMpi const* A, CvmMpi const* N) {
-    /* Extended Euclidean algorithm (iterative, sign-magnitude). */
-    CvmMpi g, x, y, u, v;
-    cvmcrypt_mpi_init(&g);
-    cvmcrypt_mpi_init(&x);
-    cvmcrypt_mpi_init(&y);
-    cvmcrypt_mpi_init(&u);
-    cvmcrypt_mpi_init(&v);
+    /* Iterative extended Euclidean algorithm.
+     * Maintains: r_i = t_i * A (mod N). When r becomes 1, t is the inverse.
+     *   r = N, new_r = A mod N
+     *   t = 0, new_t = 1
+     *   while new_r != 0:
+     *     q = r / new_r
+     *     (r, new_r) = (new_r, r - q*new_r)
+     *     (t, new_t) = (new_t, t - q*new_t)
+     *   if r != 1: no inverse exists
+     *   return t (if negative, add N)
+     */
+    CvmMpi r, new_r, t, new_t, q, tmp;
+    cvmcrypt_mpi_init(&r);
+    cvmcrypt_mpi_init(&new_r);
+    cvmcrypt_mpi_init(&t);
+    cvmcrypt_mpi_init(&new_t);
+    cvmcrypt_mpi_init(&q);
+    cvmcrypt_mpi_init(&tmp);
 
-    /* g = N, x = 0, y = 1, u = A mod N, v = N */
-    if (!cvmcrypt_mpi_copy(&g, N))
-        goto fail;
-    if (!cvmcrypt_mpi_copy(&u, A))
-        goto fail;
-    if (!cvmcrypt_mpi_mod_mpi(&u, &u, N))
-        goto fail;
-    if (!cvmcrypt_mpi_copy(&v, N))
-        goto fail;
-    if (!cvmcrypt_mpi_grow(&x, 1))
-        goto fail;
-    if (!cvmcrypt_mpi_grow(&y, 1))
-        goto fail;
-    y.p[0] = 1;
+    bool ok = false;
 
-    while (!cvmcrypt_mpi_is_zero(&u)) {
-        /* u, v = min, max; adjust x, y accordingly */
-        if (cvmcrypt_mpi_cmp_abs(&u, &v) <= 0) {
-            if (!cvmcrypt_mpi_sub_abs(&v, &v, &u)) { /* v -= u */
-                /* v < u shouldn't happen since u <= v */
-                goto fail;
+    /* r = N, new_r = A mod N */
+    if (!cvmcrypt_mpi_copy(&r, N))
+        goto done;
+    if (!cvmcrypt_mpi_mod_mpi(&new_r, A, N))
+        goto done;
+    /* t = 0, new_t = 1 */
+    {
+        u8 one = 1;
+        if (!cvmcrypt_mpi_read_binary(&new_t, &one, 1))
+            goto done;
+    }
+
+    while (!cvmcrypt_mpi_is_zero(&new_r)) {
+        /* q = r / new_r */
+        if (!cvmcrypt_mpi_div_mpi(&q, NULL, &r, &new_r))
+            goto done;
+        /* tmp = q * new_r */
+        if (!cvmcrypt_mpi_mul_mpi(&tmp, &q, &new_r))
+            goto done;
+        /* new_r <-> r - tmp */
+        {
+            CvmMpi next_r;
+            cvmcrypt_mpi_init(&next_r);
+            /* r >= new_r always (invariant of Euclid), so r - tmp >= 0 */
+            if (!cvmcrypt_mpi_sub_abs(&next_r, &r, &tmp)) {
+                cvmcrypt_mpi_free(&next_r);
+                goto done;
             }
-        } else {
-            if (!cvmcrypt_mpi_sub_abs(&u, &u, &v))
-                goto fail;
+            cvmcrypt_mpi_swap(&r, &new_r);      /* r = old new_r */
+            cvmcrypt_mpi_swap(&new_r, &next_r); /* new_r = r - q*new_r */
+            cvmcrypt_mpi_free(&next_r);
+        }
+        /* t update: new_t <-> t - q*new_t (signed).
+         * q is always positive, so tmp.s = new_t.s. */
+        {
+            if (!cvmcrypt_mpi_mul_mpi(&tmp, &q, &new_t))
+                goto done;
+            CvmMpi next_t;
+            cvmcrypt_mpi_init(&next_t);
+            if (t.s == tmp.s) {
+                /* Same sign: |result| = ||t| - |tmp||, sign of larger. */
+                if (cvmcrypt_mpi_cmp_abs(&t, &tmp) >= 0) {
+                    if (!cvmcrypt_mpi_sub_abs(&next_t, &t, &tmp)) {
+                        cvmcrypt_mpi_free(&next_t);
+                        goto done;
+                    }
+                    next_t.s = t.s;
+                } else {
+                    if (!cvmcrypt_mpi_sub_abs(&next_t, &tmp, &t)) {
+                        cvmcrypt_mpi_free(&next_t);
+                        goto done;
+                    }
+                    next_t.s = -t.s;
+                }
+            } else {
+                /* Different signs: |result| = |t| + |tmp|, sign of t. */
+                if (!cvmcrypt_mpi_add_abs(&next_t, &t, &tmp)) {
+                    cvmcrypt_mpi_free(&next_t);
+                    goto done;
+                }
+                next_t.s = t.s;
+            }
+            cvmcrypt_mpi_swap(&t, &new_t);
+            cvmcrypt_mpi_swap(&new_t, &next_t);
+            cvmcrypt_mpi_free(&next_t);
         }
     }
 
-    /* v = gcd(A, N). If v != 1, no inverse exists. */
-    if (v.n == 0 || (v.n == 1 && v.p[0] != 1)) {
-        goto fail;
+    /* r must be 1 for an inverse to exist. */
+    if (r.n != 1 || r.p[0] != 1)
+        goto done;
+
+    /* If t is negative: X = N - |t| (since 0 < |t| < N when gcd = 1). */
+    if (t.s < 0) {
+        CvmMpi pos;
+        cvmcrypt_mpi_init(&pos);
+        if (!cvmcrypt_mpi_sub_abs(&pos, N, &t)) {
+            cvmcrypt_mpi_free(&pos);
+            goto done;
+        }
+        cvmcrypt_mpi_swap(X, &pos);
+        cvmcrypt_mpi_free(&pos);
+    } else {
+        /* Reduce t mod N (t might exceed N). */
+        if (!cvmcrypt_mpi_mod_mpi(X, &t, N))
+            goto done;
     }
 
-    /* Result is in g (the modular inverse). */
-    cvmcrypt_mpi_swap(X, &g);
-
-    cvmcrypt_mpi_free(&g);
-    cvmcrypt_mpi_free(&x);
-    cvmcrypt_mpi_free(&y);
-    cvmcrypt_mpi_free(&u);
-    cvmcrypt_mpi_free(&v);
-    return true;
-
-fail:
-    cvmcrypt_mpi_free(&g);
-    cvmcrypt_mpi_free(&x);
-    cvmcrypt_mpi_free(&y);
-    cvmcrypt_mpi_free(&u);
-    cvmcrypt_mpi_free(&v);
-    return false;
+    ok = true;
+done:
+    cvmcrypt_mpi_free(&r);
+    cvmcrypt_mpi_free(&new_r);
+    cvmcrypt_mpi_free(&t);
+    cvmcrypt_mpi_free(&new_t);
+    cvmcrypt_mpi_free(&q);
+    cvmcrypt_mpi_free(&tmp);
+    return ok;
 }
 
 /* ------------------------------------------------------------------ */
