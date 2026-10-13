@@ -1,0 +1,25 @@
+cvmcrypt
+========
+
+This library is written from scratch for the cvm runtime. Portions of
+the algorithm implementations are carried over, rewritten to cvm's
+coding conventions, from the following projects:
+
+  * libtomcrypt (develop branch, v1.18.2-1245-g6c6d510)
+    — Unlicense (public domain)
+    — ciphers, AEAD, hashes, MACs, key exchange, public-key primitives,
+      ASN.1/DER, algorithm registry
+
+  * Mbed TLS 3.6.7
+    — Apache-2.0 OR GPL-2.0-or-later; we take it under Apache-2.0
+    — bignum (library/bignum*.c), X.509 parsing and chain validation
+      (library/x509*.c), ASN.1 (library/asn1parse.c), OID tables
+      (library/oid.c), platform utilities (library/platform_util.c)
+
+  * cvm (vendor/cvm submodule)
+    — the rt/ platform layer this library references; same project
+    — vm/mem.c, adapted here as src/base/mem.c
+
+Each source file records where it came from in its header comment.
+Files derived from Mbed TLS carry its copyright notice and
+SPDX-License-Identifier; the Apache-2.0 text is in LICENSE-APACHE.

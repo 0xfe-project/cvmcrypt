@@ -1,0 +1,3 @@
+[submodule "vendor/cvm"]
+	path = vendor/cvm
+	url = https://github.com/0xfe-project/cvm.git
