@@ -71,8 +71,10 @@ DerStatus der_read_tlv(DerCursor* c, u8 expected_tag, DerCursor* content) {
     if (c->remaining < len)
         return DER_ERR_TRUNCATED;
 
-    content->p = c->p;
-    content->remaining = len;
+    if (content) {
+        content->p = c->p;
+        content->remaining = len;
+    }
     c->p += len;
     c->remaining -= len;
     return DER_OK;
