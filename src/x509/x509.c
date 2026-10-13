@@ -344,16 +344,18 @@ X509Status cvmcrypt_x509_verify_signature(CvmX509Cert const* cert,
             cvmcrypt_mpi_free(&s_mpi);
             return X509_ERR_BAD_SIGNATURE;
         }
-        u8 r_buf[32], s_buf[32];
-        bool write_ok = cvmcrypt_mpi_write_binary(&r_mpi, r_buf, 32) &&
-                        cvmcrypt_mpi_write_binary(&s_mpi, s_buf, 32);
+        /* Buffer size depends on curve: P-256→32, P-384→48. */
+        usize coord_len = (issuer->ec_key.curve == EC_CURVE_P384) ? 48 : 32;
+        u8 r_buf[48], s_buf[48];
+        bool write_ok = cvmcrypt_mpi_write_binary(&r_mpi, r_buf, coord_len) &&
+                        cvmcrypt_mpi_write_binary(&s_mpi, s_buf, coord_len);
         cvmcrypt_mpi_free(&r_mpi);
         cvmcrypt_mpi_free(&s_mpi);
         if (!write_ok)
             return X509_ERR_BAD_SIGNATURE;
 
-        return cvmcrypt_ecdsa_verify(&issuer->ec_key, hash, hash_len, r_buf, 32, s_buf,
-                                     32)
+        return cvmcrypt_ecdsa_verify(&issuer->ec_key, hash, hash_len, r_buf, coord_len,
+                                     s_buf, coord_len)
                    ? X509_OK
                    : X509_ERR_BAD_SIGNATURE;
     }

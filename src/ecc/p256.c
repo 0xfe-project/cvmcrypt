@@ -48,6 +48,56 @@ static u8 const P256_N[32] = {
 };
 
 /* ------------------------------------------------------------------ */
+/* P-384 (secp384r1) — SEC 2 */
+/* ------------------------------------------------------------------ */
+
+/* p = 2^384 - 2^128 - 2^96 + 2^32 - 1 */
+static u8 const P384_P[48] = {
+    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xfe, 0xff, 0xff, 0xff, 0xff,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff,
+};
+
+/* Gx */
+static u8 const P384_GX[48] = {
+    0xaa, 0x87, 0xca, 0x22, 0xbe, 0x8b, 0x05, 0x37, 0x8e, 0xb1, 0xc7, 0x1e,
+    0xf3, 0x20, 0xad, 0x74, 0x6e, 0x1d, 0x3b, 0x62, 0x8b, 0xa7, 0x9b, 0x98,
+    0x59, 0xf7, 0x41, 0xe0, 0x82, 0x54, 0x2a, 0x38, 0x55, 0x02, 0xf2, 0x5d,
+    0xbf, 0x55, 0x29, 0x6c, 0x3a, 0x54, 0x5e, 0x38, 0x72, 0x76, 0x0a, 0xb7,
+};
+
+/* Gy */
+static u8 const P384_GY[48] = {
+    0x36, 0x17, 0xde, 0x4a, 0x96, 0x26, 0x2c, 0x6f, 0x5d, 0x9e, 0x98, 0xbf,
+    0x92, 0x92, 0xdc, 0x29, 0xf8, 0xf4, 0x1d, 0xbd, 0x28, 0x9a, 0x14, 0x7c,
+    0xe9, 0xda, 0x31, 0x13, 0xb5, 0xf0, 0xb8, 0xc0, 0x0a, 0x60, 0xb1, 0xce,
+    0x1d, 0x7e, 0x81, 0x9d, 0x7a, 0x43, 0x1d, 0x7c, 0x90, 0xea, 0x0e, 0x5f,
+};
+
+/* n (group order) */
+static u8 const P384_N[48] = {
+    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+    0xc7, 0x63, 0x4d, 0x81, 0xf4, 0x37, 0x2d, 0xdf, 0x58, 0x1a, 0x0d, 0xb2,
+    0x48, 0xb0, 0xa7, 0x7a, 0xec, 0xec, 0x19, 0x6a, 0xcc, 0xc5, 0x29, 0x73,
+};
+
+/* Curve parameter lookup: (p, n, gx, gy, coord_len) by curve id. */
+typedef struct EcCurveParams {
+    u8 const* p;
+    u8 const* n;
+    u8 const* gx;
+    u8 const* gy;
+    usize coord_len; /* bytes per coordinate (32 for P-256, 48 for P-384) */
+} EcCurveParams;
+
+static EcCurveParams const CURVES[] = {
+    [EC_CURVE_P256] = {P256_P, P256_N, P256_GX, P256_GY, 32},
+    [EC_CURVE_P384] = {P384_P, P384_N, P384_GX, P384_GY, 48},
+};
+
+/* ------------------------------------------------------------------ */
 /* field helpers                                                        */
 /* ------------------------------------------------------------------ */
 
@@ -507,6 +557,7 @@ done:
 /* ------------------------------------------------------------------ */
 
 void cvmcrypt_ec_init(CvmEcPoint* pt) {
+    pt->curve = EC_CURVE_P256;
     cvmcrypt_mpi_init(&pt->x);
     cvmcrypt_mpi_init(&pt->y);
 }
@@ -517,14 +568,27 @@ void cvmcrypt_ec_free(CvmEcPoint* pt) {
 }
 
 EcStatus cvmcrypt_ec_import_point(CvmEcPoint* pt, u8 const* buf, usize buflen) {
-    /* Expect uncompressed: 04 || X(32) || Y(32) = 65 bytes */
-    if (buflen != 65 || buf[0] != 0x04)
+    /* Uncompressed point: 04 || X(coord_len) || Y(coord_len).
+     * Detect curve from total size: 65 → P-256, 97 → P-384. */
+    if (buf == NULL || buflen < 1 || buf[0] != 0x04)
         return EC_ERR_PARSE;
-    if (!cvmcrypt_mpi_read_binary(&pt->x, buf + 1, 32))
-        return EC_ERR_PARSE;
-    if (!cvmcrypt_mpi_read_binary(&pt->y, buf + 33, 32))
-        return EC_ERR_PARSE;
-    return EC_OK;
+    if (buflen == 65) {
+        pt->curve = EC_CURVE_P256;
+        if (!cvmcrypt_mpi_read_binary(&pt->x, buf + 1, 32))
+            return EC_ERR_PARSE;
+        if (!cvmcrypt_mpi_read_binary(&pt->y, buf + 33, 32))
+            return EC_ERR_PARSE;
+        return EC_OK;
+    }
+    if (buflen == 97) {
+        pt->curve = EC_CURVE_P384;
+        if (!cvmcrypt_mpi_read_binary(&pt->x, buf + 1, 48))
+            return EC_ERR_PARSE;
+        if (!cvmcrypt_mpi_read_binary(&pt->y, buf + 49, 48))
+            return EC_ERR_PARSE;
+        return EC_OK;
+    }
+    return EC_ERR_PARSE;
 }
 
 bool cvmcrypt_ecdsa_verify(CvmEcPoint const* q, u8 const* hash, usize hash_len,
@@ -543,15 +607,18 @@ bool cvmcrypt_ecdsa_verify(CvmEcPoint const* q, u8 const* hash, usize hash_len,
     cvmcrypt_mpi_init(&v);
     bool ok = false;
 
-    /* Load curve constants. */
-    if (!cvmcrypt_mpi_read_binary(&p, P256_P, 32))
-        goto done;
-    if (!cvmcrypt_mpi_read_binary(&n, P256_N, 32))
-        goto done;
-    if (!cvmcrypt_mpi_read_binary(&gx, P256_GX, 32))
-        goto done;
-    if (!cvmcrypt_mpi_read_binary(&gy, P256_GY, 32))
-        goto done;
+    /* Load curve parameters based on the key's curve. */
+    {
+        EcCurveParams const* cp = &CURVES[q->curve];
+        if (!cvmcrypt_mpi_read_binary(&p, cp->p, cp->coord_len))
+            goto done;
+        if (!cvmcrypt_mpi_read_binary(&n, cp->n, cp->coord_len))
+            goto done;
+        if (!cvmcrypt_mpi_read_binary(&gx, cp->gx, cp->coord_len))
+            goto done;
+        if (!cvmcrypt_mpi_read_binary(&gy, cp->gy, cp->coord_len))
+            goto done;
+    }
 
     /* Parse r, s. */
     if (!cvmcrypt_mpi_read_binary(&r, r_buf, r_len))
@@ -794,12 +861,18 @@ EcStatus cvmcrypt_ec_import_spki(CvmEcPoint* pt, u8 const* der, usize derlen) {
     if (oid_len != sizeof(EC_OID) || memcmp(oid, EC_OID, sizeof(EC_OID)) != 0)
         return EC_ERR_PARSE;
 
-    /* parameters: namedCurve OID. P-256 = 1.2.840.10045.3.1.1 */
+    /* parameters: namedCurve OID.
+     * P-256 = 1.2.840.10045.3.1.7 → 2a 86 48 ce 3d 03 01 07
+     * P-384 = 1.3.132.0.34      → 2b 81 04 00 22 */
     if (der_read_oid(&algo, &oid, &oid_len) != DER_OK)
         return EC_ERR_PARSE;
     static u8 const P256_OID[] = {0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07};
-    /* Note: P-256's OID is 1.2.840.10045.3.1.7, encoded as 2a 86 48 ce 3d 03 01 07 */
-    if (oid_len != sizeof(P256_OID) || memcmp(oid, P256_OID, sizeof(P256_OID)) != 0)
+    static u8 const P384_OID[] = {0x2b, 0x81, 0x04, 0x00, 0x22};
+    bool is_p256 =
+        oid_len == sizeof(P256_OID) && memcmp(oid, P256_OID, sizeof(P256_OID)) == 0;
+    bool is_p384 =
+        oid_len == sizeof(P384_OID) && memcmp(oid, P384_OID, sizeof(P384_OID)) == 0;
+    if (!is_p256 && !is_p384)
         return EC_ERR_PARSE;
 
     /* subjectPublicKey BIT STRING */
