@@ -25,10 +25,12 @@ void cvmcrypt_x509_init(CvmX509Cert* cert) {
     memset(cert, 0, sizeof(*cert));
     cert->path_len = -1;
     cvmcrypt_rsa_init(&cert->rsa_key);
+    cvmcrypt_ec_init(&cert->ec_key);
 }
 
 void cvmcrypt_x509_free(CvmX509Cert* cert) {
     cvmcrypt_rsa_free(&cert->rsa_key);
+    cvmcrypt_ec_free(&cert->ec_key);
     memset(cert, 0, sizeof(*cert));
     cert->path_len = -1;
 }
@@ -264,11 +266,14 @@ X509Status cvmcrypt_x509_parse(CvmX509Cert* cert, u8 const* der, usize derlen) {
         cert->sig_len = sig_len;
     }
 
-    /* Parse the RSA public key. */
+    /* Parse the public key: RSA first, then EC. */
     if (cert->spki_der != NULL && cert->spki_der_len > 0) {
         if (cvmcrypt_rsa_import_spki(&cert->rsa_key, cert->spki_der,
                                      cert->spki_der_len)) {
             cert->pk_type = X509_PK_RSA;
+        } else if (cvmcrypt_ec_import_spki(&cert->ec_key, cert->spki_der,
+                                           cert->spki_der_len) == EC_OK) {
+            cert->pk_type = X509_PK_EC;
         } else {
             cert->pk_type = X509_PK_UNKNOWN;
         }
@@ -281,16 +286,14 @@ X509Status cvmcrypt_x509_verify_signature(CvmX509Cert const* cert,
                                           CvmX509Cert const* issuer) {
     if (cert->sig_alg == X509_SIG_UNKNOWN)
         return X509_ERR_UNSUPPORTED_ALG;
-    if (issuer->pk_type != X509_PK_RSA)
-        return X509_ERR_UNSUPPORTED_ALG;
 
     u8 hash[64];
     usize hash_len;
-    CvmRsaHashId hash_id;
 
+    /* Compute hash of TBS based on the signature algorithm. */
     switch (cert->sig_alg) {
-    case X509_SIG_RSA_SHA256: {
-        hash_id = CVMCRYPT_RSA_HASH_SHA256;
+    case X509_SIG_RSA_SHA256:
+    case X509_SIG_ECDSA_SHA256: {
         hash_len = 32;
         CvmcryptSha256 h;
         cvmcrypt_sha256_init(&h);
@@ -298,8 +301,8 @@ X509Status cvmcrypt_x509_verify_signature(CvmX509Cert const* cert,
         cvmcrypt_sha256_final(&h, hash);
         break;
     }
-    case X509_SIG_RSA_SHA384: {
-        hash_id = CVMCRYPT_RSA_HASH_SHA384;
+    case X509_SIG_RSA_SHA384:
+    case X509_SIG_ECDSA_SHA384: {
         hash_len = 48;
         CvmcryptSha512 h;
         cvmcrypt_sha384_init(&h);
@@ -308,7 +311,6 @@ X509Status cvmcrypt_x509_verify_signature(CvmX509Cert const* cert,
         break;
     }
     case X509_SIG_RSA_SHA512: {
-        hash_id = CVMCRYPT_RSA_HASH_SHA512;
         hash_len = 64;
         CvmcryptSha512 h;
         cvmcrypt_sha512_init(&h);
@@ -320,10 +322,67 @@ X509Status cvmcrypt_x509_verify_signature(CvmX509Cert const* cert,
         return X509_ERR_UNSUPPORTED_ALG;
     }
 
-    return cvmcrypt_rsa_verify_pkcs1_v15(&issuer->rsa_key, hash_id, hash, hash_len,
-                                         cert->sig, cert->sig_len)
-               ? X509_OK
-               : X509_ERR_BAD_SIGNATURE;
+    /* ECDSA path: signature is DER SEQUENCE { INTEGER r, INTEGER s }. */
+    if (cert->sig_alg == X509_SIG_ECDSA_SHA256 ||
+        cert->sig_alg == X509_SIG_ECDSA_SHA384) {
+        if (issuer->pk_type != X509_PK_EC)
+            return X509_ERR_UNSUPPORTED_ALG;
+
+        /* Parse the DER signature: SEQUENCE { INTEGER r, INTEGER s }. */
+        DerCursor c = der_cursor_init(cert->sig, cert->sig_len);
+        DerCursor seq;
+        if (der_read_sequence(&c, &seq) != DER_OK)
+            return X509_ERR_BAD_SIGNATURE;
+
+        CvmMpi r_mpi, s_mpi;
+        cvmcrypt_mpi_init(&r_mpi);
+        cvmcrypt_mpi_init(&s_mpi);
+        bool parse_ok = der_read_integer(&seq, &r_mpi) == DER_OK &&
+                        der_read_integer(&seq, &s_mpi) == DER_OK;
+        if (!parse_ok) {
+            cvmcrypt_mpi_free(&r_mpi);
+            cvmcrypt_mpi_free(&s_mpi);
+            return X509_ERR_BAD_SIGNATURE;
+        }
+        u8 r_buf[32], s_buf[32];
+        bool write_ok = cvmcrypt_mpi_write_binary(&r_mpi, r_buf, 32) &&
+                        cvmcrypt_mpi_write_binary(&s_mpi, s_buf, 32);
+        cvmcrypt_mpi_free(&r_mpi);
+        cvmcrypt_mpi_free(&s_mpi);
+        if (!write_ok)
+            return X509_ERR_BAD_SIGNATURE;
+
+        return cvmcrypt_ecdsa_verify(&issuer->ec_key, hash, hash_len, r_buf, 32, s_buf,
+                                     32)
+                   ? X509_OK
+                   : X509_ERR_BAD_SIGNATURE;
+    }
+
+    /* RSA path: PKCS#1 v1.5. */
+    {
+        CvmRsaHashId hash_id;
+        switch (cert->sig_alg) {
+        case X509_SIG_RSA_SHA256:
+            hash_id = CVMCRYPT_RSA_HASH_SHA256;
+            break;
+        case X509_SIG_RSA_SHA384:
+            hash_id = CVMCRYPT_RSA_HASH_SHA384;
+            break;
+        case X509_SIG_RSA_SHA512:
+            hash_id = CVMCRYPT_RSA_HASH_SHA512;
+            break;
+        default:
+            return X509_ERR_UNSUPPORTED_ALG;
+        }
+
+        if (issuer->pk_type != X509_PK_RSA)
+            return X509_ERR_UNSUPPORTED_ALG;
+
+        return cvmcrypt_rsa_verify_pkcs1_v15(&issuer->rsa_key, hash_id, hash, hash_len,
+                                             cert->sig, cert->sig_len)
+                   ? X509_OK
+                   : X509_ERR_BAD_SIGNATURE;
+    }
 }
 
 X509Status cvmcrypt_x509_check_validity(CvmX509Cert const* cert, i64 now) {

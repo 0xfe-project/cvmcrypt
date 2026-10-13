@@ -12,6 +12,7 @@
 #include "base/types.h"
 #include "math/bignum.h"
 #include "pk/rsa.h"
+#include "ecc/p256.h"
 
 /* ------------------------------------------------------------------ */
 /* types                                                                */
@@ -72,6 +73,7 @@ typedef struct CvmX509Cert {
     /* Parsed public key (RSA only for now; EC is a stub). */
     X509PkType pk_type;
     CvmRsaKey rsa_key; /* valid if pk_type == X509_PK_RSA */
+    CvmEcPoint ec_key; /* valid if pk_type == X509_PK_EC */
 
     /* Extension data (borrowed). */
     bool is_ca;        /* basicConstraints CA flag */
