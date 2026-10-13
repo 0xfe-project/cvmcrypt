@@ -274,7 +274,9 @@ bool cvmcrypt_mpi_sub_abs(CvmMpi* X, CvmMpi const* A, CvmMpi const* B) {
         u64 b = (i < B->n) ? B->p[i] : 0;
         u64 d = a - b - borrow;
         X->p[i] = (mpi_uint)d;
-        borrow = (d >> 63) & 1;
+        /* Borrow detection: if the unsigned result is larger than the
+         * minuend, the subtraction wrapped around (underflowed). */
+        borrow = (d > a) ? 1 : 0;
     }
     X->s = 1;
     cvmcrypt_mpi_shrink(X);
