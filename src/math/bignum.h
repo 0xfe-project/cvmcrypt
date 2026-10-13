@@ -26,7 +26,7 @@ typedef i64 mpi_sint; /* signed limb for intermediate results */
 #define MPI_LIMB_MAX UINT64_MAX
 
 /* Maximum number of limbs for MPI operations. */
-#define MPI_MAX_LIMBS (1024 / MPI_LIMB_BITS)
+#define MPI_MAX_LIMBS (4096 / MPI_LIMB_BITS)
 
 /*
  * The multi-precision integer. s represents the sign (1 = negative,
