@@ -609,9 +609,13 @@ bool cvmcrypt_mpi_write_binary(CvmMpi const* X, u8* buf, usize buflen) {
         return false;
 
     memset(buf, 0, buflen);
+    /* Right-align: the value occupies the LAST `bytes` bytes of the
+     * buffer (big-endian, zero-padded from the left). This matches
+     * PKCS#1's EM representation where leading zeros are significant. */
+    u8* out = buf + (buflen - bytes);
     for (usize i = 0; i < bytes; i++) {
         usize byte_from_end = bytes - 1 - i;
-        buf[i] = (u8)(X->p[byte_from_end / MPI_LIMB_BYTES] >>
+        out[i] = (u8)(X->p[byte_from_end / MPI_LIMB_BYTES] >>
                       ((byte_from_end % MPI_LIMB_BYTES) * 8));
     }
     return true;
