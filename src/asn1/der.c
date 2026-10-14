@@ -114,8 +114,10 @@ DerStatus der_read_integer(DerCursor* c, CvmMpi* out) {
         len--;
     }
 
-    if (!cvmcrypt_mpi_read_binary(out, data, len))
-        return DER_ERR_OVERFLOW;
+    if (out != NULL) {
+        if (!cvmcrypt_mpi_read_binary(out, data, len))
+            return DER_ERR_OVERFLOW;
+    }
     return DER_OK;
 }
 

@@ -19,6 +19,17 @@ typedef struct CvmRsaKey {
     CvmMpi e; /* public exponent */
 } CvmRsaKey;
 
+typedef struct CvmRsaPriv {
+    CvmMpi n;    /* modulus */
+    CvmMpi e;    /* public exponent */
+    CvmMpi d;    /* private exponent */
+    CvmMpi p;    /* prime 1 */
+    CvmMpi q;    /* prime 2 */
+    CvmMpi dP;   /* d mod (p-1) */
+    CvmMpi dQ;   /* d mod (q-1) */
+    CvmMpi qInv; /* q^-1 mod p */
+} CvmRsaPriv;
+
 typedef enum {
     CVMCRYPT_RSA_HASH_SHA256 = 0,
     CVMCRYPT_RSA_HASH_SHA384,
@@ -48,5 +59,27 @@ bool cvmcrypt_rsa_verify_pss(CvmRsaKey const* key, CvmRsaHashId hash_id, u8 cons
 
 /* Compute RSA operation: result = sig^e mod n. Used by both verify paths. */
 bool cvmcrypt_rsa_public(CvmMpi* result, CvmMpi const* sig, CvmRsaKey const* key);
+
+/* ------------------------------------------------------------------ */
+/* private key + signing                                                */
+/* ------------------------------------------------------------------ */
+
+void cvmcrypt_rsa_priv_init(CvmRsaPriv* key);
+void cvmcrypt_rsa_priv_free(CvmRsaPriv* key);
+
+/* Import RSA private key from PKCS#8 DER (contains RSAPrivateKey). */
+bool cvmcrypt_rsa_priv_import_pkcs8(CvmRsaPriv* key, u8 const* der, usize derlen);
+
+/* Sign with PKCS#1 v1.5 (RSASSA-PKCS1-V1_5-SIGN, RFC 8017 §8.2.1).
+ * sig must have space for bitlen(n)/8 bytes. Returns sig length or 0. */
+usize cvmcrypt_rsa_sign_pkcs1_v15(CvmRsaPriv const* key, CvmRsaHashId hash_id,
+                                  u8 const* hash, usize hashlen, u8* sig,
+                                  usize sig_cap);
+
+/* Sign with PSS (RSASSA-PSS-SIGN, RFC 8017 §8.1.1).
+ * salt_len = hash_len. Returns sig length or 0. */
+usize cvmcrypt_rsa_sign_pss(CvmRsaPriv const* key, CvmRsaHashId hash_id, u8 const* hash,
+                            usize hashlen, u8* sig, usize sig_cap, u8 const* salt,
+                            usize salt_len);
 
 #endif /* CVMCRYPT_PK_RSA_H */

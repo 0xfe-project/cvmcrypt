@@ -887,3 +887,254 @@ EcStatus cvmcrypt_ec_import_spki(CvmEcPoint* pt, u8 const* der, usize derlen) {
     /* Point: 04 || X || Y */
     return cvmcrypt_ec_import_point(pt, pk, pk_len);
 }
+
+/* ------------------------------------------------------------------ */
+/* ECDSA sign                                                           */
+/* ------------------------------------------------------------------ */
+
+void cvmcrypt_ec_priv_init(CvmEcPriv* key) {
+    key->curve = EC_CURVE_P256;
+    cvmcrypt_mpi_init(&key->d);
+}
+
+void cvmcrypt_ec_priv_free(CvmEcPriv* key) {
+    cvmcrypt_mpi_free(&key->d);
+}
+
+EcStatus cvmcrypt_ec_priv_import_pkcs8(CvmEcPriv* key, u8 const* der, usize derlen) {
+    /* PrivateKeyInfo ::= SEQUENCE {
+     *   version INTEGER,
+     *   privateKeyAlgorithm AlgorithmIdentifier,
+     *   privateKey OCTET STRING }  -- contains DER ECPrivateKey
+     *
+     * ECPrivateKey ::= SEQUENCE {
+     *   version INTEGER {1},
+     *   privateKey OCTET STRING,
+     *   [0] namedCurve OID OPTIONAL,
+     *   [1] BIT STRING OPTIONAL } */
+    DerCursor c = der_cursor_init(der, derlen);
+    DerCursor seq, algo;
+    if (der_read_sequence(&c, &seq) != DER_OK)
+        return EC_ERR_PARSE;
+    if (der_read_integer(&seq, NULL) != DER_OK)
+        return EC_ERR_PARSE;
+    if (der_read_sequence(&seq, &algo) != DER_OK)
+        return EC_ERR_PARSE;
+
+    /* Check algorithm is id-ecPublicKey. */
+    {
+        u8 const* oid;
+        usize oid_len;
+        if (der_read_oid(&algo, &oid, &oid_len) != DER_OK)
+            return EC_ERR_PARSE;
+        static u8 const EC_OID[] = {0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01};
+        if (oid_len != sizeof(EC_OID) || memcmp(oid, EC_OID, sizeof(EC_OID)) != 0)
+            return EC_ERR_PARSE;
+    }
+
+    u8 const* pk;
+    usize pk_len;
+    if (der_read_octet_string(&seq, &pk, &pk_len) != DER_OK)
+        return EC_ERR_PARSE;
+
+    /* Parse ECPrivateKey. */
+    DerCursor ec = der_cursor_init(pk, pk_len);
+    DerCursor ec_seq;
+    if (der_read_sequence(&ec, &ec_seq) != DER_OK)
+        return EC_ERR_PARSE;
+    /* version */
+    if (der_read_integer(&ec_seq, NULL) != DER_OK)
+        return EC_ERR_PARSE;
+    /* privateKey OCTET STRING */
+    {
+        u8 const* d_bytes;
+        usize d_len;
+        if (der_read_octet_string(&ec_seq, &d_bytes, &d_len) != DER_OK)
+            return EC_ERR_PARSE;
+        if (!cvmcrypt_mpi_read_binary(&key->d, d_bytes, d_len))
+            return EC_ERR_PARSE;
+    }
+    /* [0] namedCurve OID — detect curve. */
+    {
+        DerCursor ctx0;
+        if (der_read_ctx(&ec_seq, 0, &ctx0) == DER_OK) {
+            u8 const* oid;
+            usize oid_len;
+            if (der_read_oid(&ctx0, &oid, &oid_len) == DER_OK) {
+                static u8 const P256_OID[] = {0x2a, 0x86, 0x48, 0xce,
+                                              0x3d, 0x03, 0x01, 0x07};
+                static u8 const P384_OID[] = {0x2b, 0x81, 0x04, 0x00, 0x22};
+                if (oid_len == sizeof(P256_OID) &&
+                    memcmp(oid, P256_OID, sizeof(P256_OID)) == 0)
+                    key->curve = EC_CURVE_P256;
+                else if (oid_len == sizeof(P384_OID) &&
+                         memcmp(oid, P384_OID, sizeof(P384_OID)) == 0)
+                    key->curve = EC_CURVE_P384;
+            }
+        }
+    }
+    return EC_OK;
+}
+
+bool cvmcrypt_ecdsa_sign(CvmEcPriv const* key, u8 const* hash, usize hash_len,
+                         u8 const* k_bytes, usize k_len, u8* r_out, u8* s_out) {
+    EcCurveParams const* cp = &CURVES[key->curve];
+    usize coord_len = cp->coord_len;
+    bool ok = false;
+
+    CvmMpi p, n, gx, gy, d, k, e, r, s, k_inv, tmp, v;
+    cvmcrypt_mpi_init(&p);
+    cvmcrypt_mpi_init(&n);
+    cvmcrypt_mpi_init(&gx);
+    cvmcrypt_mpi_init(&gy);
+    cvmcrypt_mpi_init(&d);
+    cvmcrypt_mpi_init(&k);
+    cvmcrypt_mpi_init(&e);
+    cvmcrypt_mpi_init(&r);
+    cvmcrypt_mpi_init(&s);
+    cvmcrypt_mpi_init(&k_inv);
+    cvmcrypt_mpi_init(&tmp);
+    cvmcrypt_mpi_init(&v);
+
+    if (!cvmcrypt_mpi_read_binary(&p, cp->p, coord_len))
+        goto done;
+    if (!cvmcrypt_mpi_read_binary(&n, cp->n, coord_len))
+        goto done;
+    if (!cvmcrypt_mpi_read_binary(&gx, cp->gx, coord_len))
+        goto done;
+    if (!cvmcrypt_mpi_read_binary(&gy, cp->gy, coord_len))
+        goto done;
+    if (!cvmcrypt_mpi_copy_assign(&d, &key->d))
+        goto done;
+    if (!cvmcrypt_mpi_read_binary(&k, k_bytes, k_len))
+        goto done;
+
+    /* Check 0 < k < n. */
+    if (cvmcrypt_mpi_is_zero(&k) || cvmcrypt_mpi_cmp_abs(&k, &n) >= 0)
+        goto done;
+
+    /* R = k * G; r = R.x mod n. */
+    {
+        JacPoint R;
+        jac_init(&R);
+        if (!jac_scalar_mult_G(&R, &k, &p, &gx, &gy)) {
+            jac_free(&R);
+            goto done;
+        }
+        if (R.inf) {
+            jac_free(&R);
+            goto done;
+        }
+
+        CvmMpi rx, ry;
+        cvmcrypt_mpi_init(&rx);
+        cvmcrypt_mpi_init(&ry);
+        bool conv = jac_to_affine(&rx, &ry, &R, &p);
+        jac_free(&R);
+        if (!conv) {
+            cvmcrypt_mpi_free(&rx);
+            cvmcrypt_mpi_free(&ry);
+            goto done;
+        }
+        if (!cvmcrypt_mpi_mod_mpi(&r, &rx, &n)) {
+            cvmcrypt_mpi_free(&rx);
+            cvmcrypt_mpi_free(&ry);
+            goto done;
+        }
+        cvmcrypt_mpi_free(&rx);
+        cvmcrypt_mpi_free(&ry);
+    }
+
+    /* r must be non-zero. */
+    if (cvmcrypt_mpi_is_zero(&r))
+        goto done;
+
+    /* e = hash mod n (truncate if longer). */
+    {
+        CvmMpi h;
+        cvmcrypt_mpi_init(&h);
+        if (!cvmcrypt_mpi_read_binary(&h, hash, hash_len)) {
+            cvmcrypt_mpi_free(&h);
+            goto done;
+        }
+        usize nbits = cvmcrypt_mpi_bitlen(&n);
+        usize hbits = cvmcrypt_mpi_bitlen(&h);
+        if (hbits > nbits) {
+            if (!cvmcrypt_mpi_shift_r(&h, hbits - nbits)) {
+                cvmcrypt_mpi_free(&h);
+                goto done;
+            }
+        }
+        if (!cvmcrypt_mpi_mod_mpi(&e, &h, &n)) {
+            cvmcrypt_mpi_free(&h);
+            goto done;
+        }
+        cvmcrypt_mpi_free(&h);
+    }
+
+    /* s = k^-1 * (e + r*d) mod n. */
+    if (!cvmcrypt_mpi_inv_mod(&k_inv, &k, &n))
+        goto done;
+    {
+        CvmMpi rd;
+        cvmcrypt_mpi_init(&rd);
+        if (!cvmcrypt_mpi_mul_mpi(&rd, &r, &d)) {
+            cvmcrypt_mpi_free(&rd);
+            goto done;
+        }
+        if (!cvmcrypt_mpi_mod_mpi(&rd, &rd, &n)) {
+            cvmcrypt_mpi_free(&rd);
+            goto done;
+        }
+        CvmMpi e_plus_rd;
+        cvmcrypt_mpi_init(&e_plus_rd);
+        if (!cvmcrypt_mpi_add_abs(&e_plus_rd, &e, &rd)) {
+            cvmcrypt_mpi_free(&rd);
+            cvmcrypt_mpi_free(&e_plus_rd);
+            goto done;
+        }
+        if (!cvmcrypt_mpi_mod_mpi(&e_plus_rd, &e_plus_rd, &n)) {
+            cvmcrypt_mpi_free(&rd);
+            cvmcrypt_mpi_free(&e_plus_rd);
+            goto done;
+        }
+        if (!cvmcrypt_mpi_mul_mpi(&tmp, &k_inv, &e_plus_rd)) {
+            cvmcrypt_mpi_free(&rd);
+            cvmcrypt_mpi_free(&e_plus_rd);
+            goto done;
+        }
+        if (!cvmcrypt_mpi_mod_mpi(&s, &tmp, &n)) {
+            cvmcrypt_mpi_free(&rd);
+            cvmcrypt_mpi_free(&e_plus_rd);
+            goto done;
+        }
+        cvmcrypt_mpi_free(&rd);
+        cvmcrypt_mpi_free(&e_plus_rd);
+    }
+
+    /* s must be non-zero. */
+    if (cvmcrypt_mpi_is_zero(&s))
+        goto done;
+
+    /* Write r and s. */
+    if (!cvmcrypt_mpi_write_binary(&r, r_out, coord_len))
+        goto done;
+    if (!cvmcrypt_mpi_write_binary(&s, s_out, coord_len))
+        goto done;
+
+    ok = true;
+done:
+    cvmcrypt_mpi_free(&p);
+    cvmcrypt_mpi_free(&n);
+    cvmcrypt_mpi_free(&gx);
+    cvmcrypt_mpi_free(&gy);
+    cvmcrypt_mpi_free(&d);
+    cvmcrypt_mpi_free(&k);
+    cvmcrypt_mpi_free(&e);
+    cvmcrypt_mpi_free(&r);
+    cvmcrypt_mpi_free(&s);
+    cvmcrypt_mpi_free(&k_inv);
+    cvmcrypt_mpi_free(&tmp);
+    cvmcrypt_mpi_free(&v);
+    return ok;
+}

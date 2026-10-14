@@ -48,3 +48,25 @@ bool cvmcrypt_ecdsa_verify(CvmEcPoint const* q, u8 const* hash, usize hash_len,
 EcStatus cvmcrypt_ec_import_spki(CvmEcPoint* pt, u8 const* der, usize derlen);
 
 #endif /* CVMCRYPT_ECC_P256_H */
+
+/* ------------------------------------------------------------------ */
+/* ECDSA sign (server side)                                             */
+/* ------------------------------------------------------------------ */
+
+typedef struct CvmEcPriv {
+    CvmEcCurveId curve;
+    CvmMpi d; /* private scalar */
+} CvmEcPriv;
+
+void cvmcrypt_ec_priv_init(CvmEcPriv* key);
+void cvmcrypt_ec_priv_free(CvmEcPriv* key);
+
+/* Import EC private key from PKCS#8 DER (contains ECPrivateKey). */
+EcStatus cvmcrypt_ec_priv_import_pkcs8(CvmEcPriv* key, u8 const* der, usize derlen);
+
+/* ECDSA sign (FIPS 186-4). Caller provides the random k (nonce).
+ * r/s output buffers must be coord_len bytes (32 for P-256, 48 for P-384).
+ * Returns true on success. */
+bool cvmcrypt_ecdsa_sign(CvmEcPriv const* key, u8 const* hash, usize hash_len,
+                         u8 const* k, usize k_len, /* random nonce */
+                         u8* r_out, u8* s_out);    /* coord_len each */
