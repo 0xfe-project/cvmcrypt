@@ -11,46 +11,34 @@ Comparing cvmcrypt's TLS crypto primitives against Go's standard library and Rus
 
 ## Results
 
-| Metric | cvmcrypt (-O3) | Go (stdlib) | Rust ring (--release) | cvm vs best |
-|--------|---------------:|------------:|----------------------:|------------:|
-| AES-128-GCM encrypt | **23 MB/s** | **9,981 MB/s** | **7,391 MB/s** | 433× slower |
-| SHA-256 hash | **3,522 MB/s** | **3,212 MB/s** | **2,587 MB/s** | **1.10× faster** ✅ |
-| X25519 key exchange | **215 µs/op** | — | **8.2 µs/op** | 26× slower |
-| TLS record encrypt (AAD+tag) | **23 MB/s** | **10,010 MB/s** | **7,629 MB/s** | 435× slower |
+| Metric | cvmcrypt (-O3) | Go (stdlib) | Rust ring (--release) | cvm vs Go |
+|--------|---------------:|------------:|----------------------:|----------:|
+| AES-128-GCM encrypt | **772 MB/s** | **10,187 MB/s** | **9,412 MB/s** | 13.2× slower |
+| SHA-256 hash | **3,079 MB/s** | **3,501 MB/s** | **3,553 MB/s** | 1.14× slower |
+| X25519 key exchange | **217 µs/op** | — | **6.9 µs/op** | 31× slower |
+| TLS record encrypt | **774 MB/s** | **10,212 MB/s** | **9,204 MB/s** | 13.2× slower |
+
+## Optimization History
+
+| Date | Change | AES-GCM | Improvement |
+|------|--------|--------:|------------:|
+| Initial | Scalar GHASH (bit-by-bit) | 23 MB/s | — |
+| PMULL fix | ARM64 PMULL + rbit conversion | **772 MB/s** | **33× faster** |
 
 ## Analysis
 
-### ✅ SHA-256: FASTER than Go and ring
-Our ARM64 SHA-2 intrinsics (`vsha256hq_u32` etc.) outperform both Go's generic implementation and ring's. This is because our implementation processes 2 blocks in parallel using the 128-bit NEON registers.
+### AES-128-GCM: PMULL active, 772 MB/s
+The GHASH multiplication now uses ARM64's `pmull` instruction (polynomial multiply) with `rbit` for bit-order conversion. This is 33× faster than the previous scalar path.
 
-### ❌ AES-128-GCM: 433× slower — GHASH bottleneck
-The AES core is using ARM64 `vaeseq_u8` intrinsics, but the **GHASH** (authentication tag computation) is running in scalar mode. Scalar GHASH processes ~1 bit per cycle, giving ~25 MB/s on a 4GHz+ core.
+**Remaining gap (13× vs Go/ring)**: Go and ring use *aggregated GHASH* — multiplying multiple blocks by precomputed powers of H before reducing once, amortizing per-block overhead. They also avoid the per-block `rbit` by staying in the reflected domain throughout. Implementing aggregated GHASH (4-block parallel with precomputed H, H², H³, H⁴) would close most of this gap.
 
-**Fix needed**: Enable the PMULL-based GHASH path (ARM64 polynomial multiply). The code exists (`gf128_mul` with `impl` dispatch) but the runtime detection isn't selecting the PMULL path. This is the single highest-impact optimization — fixing it would bring AES-GCM from 23 MB/s to ~5,000+ MB/s.
+### SHA-256: Competitive (3,079 vs 3,501 vs 3,553)
+ARM64 SHA-2 intrinsics with dual-block processing. Within 12% of Go/ring.
 
-**Impact on TLS throughput**: AES-GCM is the default cipher suite for TLS 1.3. At 23 MB/s, bulk HTTPS transfer is network-bound for anything faster than ~200 Mbps. With PMULL GHASH, we'd be CPU-unbound up to ~40 Gbps.
+### X25519: 31× slower
+Pure C tweetnacl-style Montgomery ladder. Go uses `crypto/ecdh` (assembly), ring uses `x25519-dalek` style optimized field arithmetic.
 
-### ❌ X25519: 26× slower
-Our pure C implementation (tweetnacl-style Montgomery ladder) at 215 µs/op vs ring's 8.2 µs/op (optimized assembly with `x25519-dalek` or similar).
-
-**Impact on handshake**: Each TLS 1.3 handshake does 1 X25519 operation. At 215 µs, this adds ~0.2ms per handshake. For a web server handling 10K connections/sec, this is 2.15 seconds of CPU per second — overloaded. At 8.2 µs it would be 0.08 seconds — fine.
-
-**Fix options**:
-1. Write ARM64 assembly for the Montgomery ladder (radix 2^51, 5 limbs)
-2. Or use a windowed scalar multiplication
-
-### ✅ Overall Assessment
-
-| Component | Status | Production Ready? |
-|-----------|--------|:-:|
-| SHA-256 | Faster than Go/ring | ✅ |
-| SHA-384/512 | Not benchmarked (same SIMD approach) | ✅ |
-| AES core | ARM64 intrinsics active | ✅ |
-| GHASH (GCM auth) | **Scalar fallback — needs PMULL fix** | ❌ |
-| ChaCha20-Poly1305 | Vector path (1.7-2.5× scalar) | ⚠️ |
-| X25519 | Pure C, 26× slower than ring | ⚠️ |
-| TLS 1.3 handshake | **Working** (example.com verified) | ✅ |
-| Certificate verification | RSA + ECDSA P-256/384 working | ✅ |
+**Fix**: ARM64 assembly implementation (radix 2^51, 5 limbs) would bring this to ~15 µs.
 
 ## Running
 
@@ -58,11 +46,3 @@ Our pure C implementation (tweetnacl-style Montgomery ladder) at 215 µs/op vs r
 ./build.sh    # build all three
 ./run_all.sh  # run and display results
 ```
-
-## Files
-
-- `bench_cvm.c` — cvmcrypt primitives benchmark
-- `bench_go.go` — Go stdlib crypto benchmark
-- `src/main.rs` — Rust ring benchmark
-- `build.sh` — build script
-- `run_all.sh` — run all and format output

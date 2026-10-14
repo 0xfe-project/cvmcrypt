@@ -23,7 +23,7 @@
 
 /* Scalar GHASH multiply: right-to-left shift-and-XOR.
  * Operates on 16-byte arrays in GCM bit order (MSB first). */
-static void gf128_mul_scalar(u8 const* a, u8 const* b, u8* out) {
+void gf128_mul_scalar(u8 const* a, u8 const* b, u8* out) {
     /* Z = 0, V = B */
     u8 Z[16] = {0};
     u8 V[16];
@@ -53,14 +53,88 @@ static void gf128_mul_scalar(u8 const* a, u8 const* b, u8* out) {
 #if defined(__aarch64__)
 #include <arm_neon.h>
 
-/* GHASH multiply using PMULL, following the algorithm in
- * "Intel Carry-Less Multiplication Instruction and Its Usage for
- * Computing the GCM Mode" (Rev 2.0), Section 6.1, adapted for ARM. */
-__attribute__((target("crypto"))) static void gf128_mul_pmull(u8 const* a, u8 const* b,
-                                                              u8* out) {
-    /* PMULL path not yet implemented — the 256→128 bit reduction is
-     * subtle. Fall back to scalar; PMULL will replace this for throughput. */
-    gf128_mul_scalar(a, b, out);
+/* 64-bit bit reversal via ARM64 rbit instruction. */
+__attribute__((target("crypto"))) static inline uint64_t rbit64(uint64_t v) {
+    uint64_t r;
+    __asm__("rbit %0, %1" : "=r"(r) : "r"(v));
+    return r;
+}
+
+/* Full 128-bit bit reversal: swap 64-bit halves + rbit each.
+ * Converts GHASH bit-reflected order to PMULL natural order. */
+__attribute__((target("crypto"))) static inline uint64x2_t bitrev128(uint64x2_t v) {
+    uint64_t lo = vgetq_lane_u64(v, 0);
+    uint64_t hi = vgetq_lane_u64(v, 1);
+    uint64x2_t r = {rbit64(hi), rbit64(lo)};
+    return r;
+}
+
+/* GHASH multiply using PMULL.
+ * GHASH uses bit-reflected order (leftmost bit = x^0).
+ * PMULL uses natural order (LSB = x^0).
+ * We rbit both inputs, multiply in natural order, rbit the result.
+ * Reduction in natural order: x^128 == x^7+x^2+x+1 = 0x87. */
+__attribute__((target("crypto"))) void gf128_mul_pmull(u8 const* a, u8 const* b,
+                                                       u8* out) {
+    uint8x16_t va = vld1q_u8(a);
+    uint8x16_t vb = vld1q_u8(b);
+
+    /* GHASH big-endian bytes -> LE u64x2. */
+    va = vrev64q_u8(va);
+    va = vextq_u8(va, va, 8);
+    vb = vrev64q_u8(vb);
+    vb = vextq_u8(vb, vb, 8);
+
+    /* Full bit reversal: GHASH reflected -> PMULL natural. */
+    uint64x2_t a64 = bitrev128(vreinterpretq_u64_u8(va));
+    uint64x2_t b64 = bitrev128(vreinterpretq_u64_u8(vb));
+
+    uint64_t a_lo = vgetq_lane_u64(a64, 0);
+    uint64_t a_hi = vgetq_lane_u64(a64, 1);
+    uint64_t b_lo = vgetq_lane_u64(b64, 0);
+    uint64_t b_hi = vgetq_lane_u64(b64, 1);
+
+    /* Karatsuba 128x128 carryless multiply (3 PMULLs). */
+    poly128_t pl = vmull_p64(a_lo, b_lo);
+    poly128_t ph = vmull_p64(a_hi, b_hi);
+    poly128_t pm = vmull_p64(a_lo ^ a_hi, b_lo ^ b_hi);
+
+    uint64x2_t vl = vreinterpretq_u64_p128(pl);
+    uint64x2_t vh = vreinterpretq_u64_p128(ph);
+    uint64x2_t vm = vreinterpretq_u64_p128(pm);
+
+    vm = veorq_u64(vm, vl);
+    vm = veorq_u64(vm, vh);
+
+    uint64_t d0 = vgetq_lane_u64(vl, 0);
+    uint64_t d1 = vgetq_lane_u64(vl, 1) ^ vgetq_lane_u64(vm, 0);
+    uint64_t d2 = vgetq_lane_u64(vh, 0) ^ vgetq_lane_u64(vm, 1);
+    uint64_t d3 = vgetq_lane_u64(vh, 1);
+
+    /* Reduction (natural order, R = 0x87). */
+    {
+        poly128_t t3 = vmull_p64(d3, 0x87);
+        uint64x2_t v3 = vreinterpretq_u64_p128(t3);
+        d1 ^= vgetq_lane_u64(v3, 0);
+        d2 ^= vgetq_lane_u64(v3, 1);
+    }
+    {
+        poly128_t t2 = vmull_p64(d2, 0x87);
+        uint64x2_t v2 = vreinterpretq_u64_p128(t2);
+        d0 ^= vgetq_lane_u64(v2, 0);
+        d1 ^= vgetq_lane_u64(v2, 1);
+    }
+
+    uint64x2_t result_nat = {d0, d1};
+
+    /* Bit-reverse back to GHASH order. */
+    uint64x2_t result_ghash = bitrev128(result_nat);
+
+    /* LE u64x2 -> GHASH big-endian bytes. */
+    uint8x16_t out_vec = vreinterpretq_u8_u64(result_ghash);
+    out_vec = vextq_u8(out_vec, out_vec, 8);
+    out_vec = vrev64q_u8(out_vec);
+    vst1q_u8(out, out_vec);
 }
 #endif
 
