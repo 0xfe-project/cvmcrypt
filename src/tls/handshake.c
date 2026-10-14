@@ -61,6 +61,25 @@ static void fix_block16(CvmTlsBuf* buf, usize start) {
     buf->base[start + 1] = (u8)len;
 }
 
+static int push_block24(CvmTlsBuf* buf, usize* start) {
+    int ret;
+    *start = buf->off;
+    if ((ret = cvm_tls_buf_push(buf, 0)) != 0)
+        return ret;
+    if ((ret = cvm_tls_buf_push(buf, 0)) != 0)
+        return ret;
+    if ((ret = cvm_tls_buf_push(buf, 0)) != 0)
+        return ret;
+    return 0;
+}
+
+static void fix_block24(CvmTlsBuf* buf, usize start) {
+    usize len = buf->off - start - 3;
+    buf->base[start] = (u8)(len >> 16);
+    buf->base[start + 1] = (u8)(len >> 8);
+    buf->base[start + 2] = (u8)len;
+}
+
 static int push_vec8(CvmTlsBuf* buf, CvmTlsVec v) {
     int ret;
     if (v.len > 255)
@@ -425,22 +444,22 @@ int cvm_tls_encode_certificate(CvmTlsBuf* buf, CvmTlsVec const* certs,
         return ret;
 
     /* certificate_list. */
-    if ((ret = push_block16(buf, &list_start)) != 0)
+    if ((ret = push_block24(buf, &list_start)) != 0)
         return ret;
     for (usize i = 0; i < num_certs; i++) {
         usize entry_start;
-        if ((ret = push_block16(buf, &entry_start)) != 0)
+        if ((ret = push_block24(buf, &entry_start)) != 0)
             return ret; /* cert data */
         if ((ret = cvm_tls_buf_pushv(buf, certs[i].base, certs[i].len)) != 0)
             return ret;
-        fix_block16(buf, entry_start);
+        fix_block24(buf, entry_start);
         /* extensions (empty). */
         if ((ret = cvm_tls_buf_push(buf, 0)) != 0)
             return ret;
         if ((ret = cvm_tls_buf_push(buf, 0)) != 0)
             return ret;
     }
-    fix_block16(buf, list_start);
+    fix_block24(buf, list_start);
 
     fix_handshake_length(buf, hdr_start);
     return 0;
@@ -662,7 +681,7 @@ int cvm_tls_decode_server_hello(CvmTlsServerHello* sh, u8 const* src, u8 const* 
 int cvm_tls_decode_certificate(CvmTlsCertMsg* cert, u8 const* src, u8 const* end) {
     memset(cert, 0, sizeof(*cert));
     u8 ctx_len;
-    u16 list_len;
+    u32 list_len;
     u8 const* p = src;
 
     if (tls_decode8(&ctx_len, &p, end) != 0)
@@ -670,15 +689,18 @@ int cvm_tls_decode_certificate(CvmTlsCertMsg* cert, u8 const* src, u8 const* end
     cert->request_context.base = p;
     cert->request_context.len = ctx_len;
     p += ctx_len;
-    if (tls_decode16(&list_len, &p, end) != 0)
+    if (tls_decode24(&list_len, &p, end) != 0)
         return TLS_ERROR_DECODE;
     u8 const* list_end = p + list_len;
     if (list_end > end)
         return TLS_ERROR_DECODE;
 
     while (p < list_end && cert->num_entries < 8) {
-        u16 cert_len, ext_len;
-        if (tls_decode16(&cert_len, &p, list_end) != 0)
+        u32 cert_len;
+        u16 ext_len;
+        if (tls_decode24(&cert_len, &p, list_end) != 0)
+            return TLS_ERROR_DECODE;
+        if (p + cert_len > list_end)
             return TLS_ERROR_DECODE;
         cert->entries[cert->num_entries].data.base = p;
         cert->entries[cert->num_entries].data.len = cert_len;
