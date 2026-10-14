@@ -1,11 +1,9 @@
 /*
  * tests/integration/tls_client_test.c
  *
- * Interop test: connect to a real HTTPS server, send ClientHello,
- * verify we get a ServerHello back. Proves wire-format correctness.
- *
- * Build: clang ... -o tls_client_test
- * Run:   ./tls_client_test [hostname] [port]
+ * Interop test: full TLS 1.3 handshake with a real HTTPS server.
+ * Sends ClientHello, processes ServerHello + encrypted records,
+ * completes handshake, sends HTTP GET, reads response.
  */
 
 #include <stdio.h>
@@ -15,6 +13,8 @@
 #include <arpa/inet.h>
 #include <sys/socket.h>
 #include <netdb.h>
+#include <time.h>
+#include <errno.h>
 
 #include "tls/tls.h"
 #include "tls/tls_internal.h"
@@ -33,13 +33,16 @@
 /* From crypto_cvm.c */
 void cvm_tls_context_defaults(CvmTlsContext* ctx);
 
-/* From record.c */
+/* From record.c (hosted build uses system mem funcs) */
+void cvm_tls_buf_init(CvmTlsBuf* buf, u8* small, usize small_capacity);
+int cvm_tls_buf_reserve(CvmTlsBuf* buf, usize delta);
+int cvm_tls_buf_pushv(CvmTlsBuf* buf, void const* src, usize len);
+int cvm_tls_buf_push(CvmTlsBuf* buf, u8 b);
+void cvm_tls_buf_dispose(CvmTlsBuf* buf);
 
 /* ------------------------------------------------------------------ */
-/* platform: time + random (hosted)                                     */
+/* hosted time + random                                                 */
 /* ------------------------------------------------------------------ */
-
-#include <time.h>
 
 static u64 host_get_time(CvmTlsGetTime* self) {
     (void)self;
@@ -50,7 +53,6 @@ static u64 host_get_time(CvmTlsGetTime* self) {
 
 static void host_random(CvmTlsRandomBytes* self, void* buf, usize len) {
     (void)self;
-    /* Use /dev/urandom for proper randomness. */
     FILE* f = fopen("/dev/urandom", "rb");
     if (f) {
         fread(buf, 1, len, f);
@@ -64,7 +66,7 @@ static CvmTlsGetTime const HOST_TIME = {.cb = host_get_time};
 static CvmTlsRandomBytes const HOST_RANDOM = {.cb = host_random};
 
 /* ------------------------------------------------------------------ */
-/* socket helper                                                        */
+/* socket                                                               */
 /* ------------------------------------------------------------------ */
 
 static int tcp_connect(char const* host, int port) {
@@ -76,10 +78,8 @@ static int tcp_connect(char const* host, int port) {
     snprintf(port_str, sizeof(port_str), "%d", port);
 
     struct addrinfo* res;
-    if (getaddrinfo(host, port_str, &hints, &res) != 0) {
-        fprintf(stderr, "DNS failed for %s\n", host);
+    if (getaddrinfo(host, port_str, &hints, &res) != 0)
         return -1;
-    }
 
     int fd = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
     if (fd < 0) {
@@ -106,95 +106,120 @@ int main(int argc, char** argv) {
     char const* host = argc > 1 ? argv[1] : "example.com";
     int port = argc > 2 ? atoi(argv[2]) : 443;
 
-    printf("Connecting to %s:%d...\n", host, port);
+    setbuf(stdout, NULL);
+    printf("=== TLS 1.3 interop: %s:%d ===\n", host, port);
 
     int fd = tcp_connect(host, port);
     if (fd < 0) {
-        fprintf(stderr, "FAIL: cannot connect\n");
+        fprintf(stderr, "connect failed\n");
         return 1;
     }
-    printf("TCP connected.\n");
+    printf("[1] TCP connected\n");
 
-    /* Set up TLS context with cvmcrypt crypto. */
+    /* TLS context with cvmcrypt crypto. */
     CvmTlsContext ctx;
     cvm_tls_context_defaults(&ctx);
     ctx.get_time = (CvmTlsGetTime*)&HOST_TIME;
     ctx.random_bytes = (CvmTlsRandomBytes*)&HOST_RANDOM;
 
-    /* Create TLS client. */
     CvmTls* tls = cvm_tls_new(&ctx, false, host);
-    if (tls == NULL) {
-        fprintf(stderr, "FAIL: cannot create TLS\n");
+    if (!tls) {
+        fprintf(stderr, "tls_new failed\n");
         return 1;
     }
 
-    /* Send ClientHello. */
+    /* Phase 1: send ClientHello. */
     CvmTlsBuf sendbuf;
     cvm_tls_buf_init(&sendbuf, NULL, 0);
     usize inlen = 0;
     int ret = cvm_tls_handshake(tls, &sendbuf, NULL, &inlen, NULL);
+    printf("[2] ClientHello: %zu bytes (state=%d)\n", sendbuf.off, tls->state);
 
-    printf("ClientHello generated: %zu bytes (ret=%d)\n", sendbuf.off, ret);
-
-    if (sendbuf.off == 0) {
-        fprintf(stderr, "FAIL: empty ClientHello\n");
+    if (send(fd, sendbuf.base, sendbuf.off, 0) < 0) {
+        perror("send CH");
         return 1;
     }
 
-    /* Dump first bytes for debugging. */
-    printf("CH header: %02x %02x %02x %02x %02x\n", sendbuf.base[0], sendbuf.base[1],
-           sendbuf.base[2], sendbuf.base[3], sendbuf.base[4]);
-    printf("CH dump: ");
-    for (usize i = 0; i < sendbuf.off && i < 1024; i++)
-        printf("%02x", sendbuf.base[i]);
-    printf("...\n");
-
-    /* Send to server. */
-    ssize_t sent = send(fd, sendbuf.base, sendbuf.off, 0);
-    printf("Sent %zd bytes.\n", sent);
-
-    /* Read response. */
-    u8 response[8192];
-    ssize_t n = recv(fd, response, sizeof(response), 0);
-    printf("Received %zd bytes.\n", n);
-
-    if (n < 5) {
-        fprintf(stderr, "FAIL: response too short (%zd bytes)\n", n);
-        close(fd);
-        return 1;
-    }
-
-    /* Parse as TLS record. */
-    printf("Response header: %02x %02x %02x %02x %02x\n", response[0], response[1],
-           response[2], response[3], response[4]);
-
-    u8 content_type = response[0];
-    u16 record_len = (response[3] << 8) | response[4];
-
-    printf("Content type: %u, record length: %u\n", content_type, record_len);
-
-    if (content_type == TLS_CONTENT_TYPE_ALERT) {
-        printf("Got ALERT (expected — handshake incomplete).\n");
-        if (n >= 7) {
-            printf("Alert: level=%u, description=%u\n", response[5], response[6]);
+    /* Phase 2: read and process server responses. */
+    int max_rounds = 10;
+    for (int round = 0; round < max_rounds && !tls->handshake_complete; round++) {
+        /* Read data from server. */
+        u8 input[16384];
+        ssize_t n = recv(fd, input, sizeof(input), 0);
+        if (n <= 0) {
+            printf("[!] recv returned %zd (errno=%d)\n", n, errno);
+            break;
         }
-    } else if (content_type == TLS_CONTENT_TYPE_HANDSHAKE) {
-        printf("Got HANDSHAKE response — server accepted our ClientHello!\n");
-        if (n >= 9) {
-            printf("Handshake type: %u\n", response[5]);
-            if (response[5] == TLS_HANDSHAKE_TYPE_SERVER_HELLO) {
-                printf(">>> ServerHello received! Wire format is correct.\n");
+        printf("[3.%d] Received %zd bytes from server\n", round, n);
+
+        /* Feed to TLS state machine. */
+        sendbuf.off = 0; /* reuse sendbuf for output */
+        usize consumed = (usize)n;
+        ret = cvm_tls_handshake(tls, &sendbuf, input, &consumed, NULL);
+        printf("    handshake ret=%d (0x%x), state=%d, consumed=%zu/%zd\n", ret, ret,
+               tls->state, consumed, n);
+
+        if (ret < 0 && ret != TLS_ERROR_IN_PROGRESS) {
+            printf("[!] Handshake error: %d (alert=%d)\n", ret, ret & 0xFF);
+            break;
+        }
+
+        /* Send any response data. */
+        if (sendbuf.off > 0) {
+            printf("    Sending %zu bytes response\n", sendbuf.off);
+            if (send(fd, sendbuf.base, sendbuf.off, 0) < 0) {
+                perror("send response");
+                break;
             }
         }
+
+        if (tls->handshake_complete) {
+            printf("[4] HANDSHAKE COMPLETE! cipher=%s\n",
+                   tls->suite ? tls->suite->name : "?");
+            break;
+        }
+
+        if (tls->state == TLS_STATE_CLIENT_EXPECT_ENCRYPTED_EXTENSIONS ||
+            tls->state == TLS_STATE_CLIENT_EXPECT_CERTIFICATE ||
+            tls->state == TLS_STATE_CLIENT_EXPECT_CERTIFICATE_VERIFY ||
+            tls->state == TLS_STATE_CLIENT_EXPECT_FINISHED) {
+            printf("    Progressing: state=%d\n", tls->state);
+        }
+    }
+
+    /* Phase 3: send HTTP request if handshake completed. */
+    if (tls->handshake_complete) {
+        char req[256];
+        int req_len =
+            snprintf(req, sizeof(req),
+                     "GET / HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n", host);
+        sendbuf.off = 0;
+        ret = cvm_tls_send(tls, &sendbuf, req, (usize)req_len);
+        printf("[5] HTTP request: %d bytes encrypted, ret=%d\n", sendbuf.off, ret);
+        if (send(fd, sendbuf.base, sendbuf.off, 0) < 0) {
+            perror("send HTTP");
+            return 1;
+        }
+
+        /* Read response. */
+        u8 resp[16384];
+        ssize_t n = recv(fd, resp, sizeof(resp), 0);
+        printf("[6] HTTP response: %zd bytes\n", n);
+        if (n > 0) {
+            /* Show first 200 bytes. */
+            printf("    First bytes: ");
+            for (int i = 0; i < 200 && i < n; i++)
+                printf("%c", resp[i] >= 32 && resp[i] < 127 ? resp[i] : '.');
+            printf("\n");
+        }
     } else {
-        printf("Unknown content type: %u\n", content_type);
+        printf("[!] Handshake did not complete (state=%d)\n", tls->state);
     }
 
     /* Cleanup. */
     cvm_tls_buf_dispose(&sendbuf);
     cvm_tls_free(tls);
     close(fd);
-
-    printf("\nInterop test completed.\n");
+    printf("=== done ===\n");
     return 0;
 }

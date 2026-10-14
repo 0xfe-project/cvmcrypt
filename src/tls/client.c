@@ -1,3 +1,6 @@
+#ifdef TLS_DEBUG
+#include <stdio.h>
+#endif
 /*
  * src/tls/client.c
  *
@@ -68,11 +71,20 @@ static int setup_traffic_protection(CvmTls* tls, bool is_enc, void const* secret
     if (ret != 0)
         return ret;
 
+#ifdef TLS_DEBUG
+    printf("[debug] traffic key (%s): ", label);
+    for (int i = 0; i < (int)aead->key_size; i++)
+        printf("%02x", ((u8*)key)[i]);
+    printf("\n[debug] traffic iv  (%s): ", label);
+    for (int i = 0; i < (int)aead->iv_size; i++)
+        printf("%02x", ((u8*)iv)[i]);
+    printf("\n");
+#endif
     tp->aead = aead->setup(aead, is_enc, key, iv);
     tp->seq = 0;
     tp->label = label;
 
-    cvmcrypt_secure_free(key, sizeof(key));
+    memset(key, 0, sizeof(key));
     if (tp->aead == NULL)
         return TLS_ERROR_LIBRARY;
     return 0;
@@ -131,13 +143,11 @@ static int client_send_client_hello(CvmTls* tls, CvmTlsBuf* sendbuf) {
     sendbuf->base[rec_start + 3] = (u8)(body_len >> 8);
     sendbuf->base[rec_start + 4] = (u8)body_len;
 
-    /* Save for transcript. */
-    cvm_tls_ks_init(&tls->ks, tls->ctx->cipher_suites[0]); /* default suite for now */
-    cvm_tls_ks_update_hash(&tls->ks, sendbuf->base + rec_start + 5, body_len);
-
-    /* Early secret. */
-    ret = cvm_tls_ks_extract(&tls->ks, (CvmTlsVec){NULL, 0});
-    if (ret != 0)
+    /* Save the CH handshake message (not the record header) for transcript replay. */
+    cvm_tls_buf_dispose(&tls->sendbuf_early);
+    cvm_tls_buf_init(&tls->sendbuf_early, NULL, 0);
+    if ((ret = cvm_tls_buf_pushv(&tls->sendbuf_early, sendbuf->base + rec_start + 5,
+                                 body_len)) != 0)
         return ret;
 
     tls->state = TLS_STATE_CLIENT_EXPECT_SERVER_HELLO;
@@ -186,28 +196,82 @@ static int client_handle_server_hello(CvmTls* tls, CvmTlsBuf* sendbuf,
     cvm_tls_ks_free(&tls->ks);
     cvm_tls_ks_init(&tls->ks, tls->suite);
 
-    /* Replay transcript: ClientHello + ServerHello.
-     * NOTE: We saved ClientHello in ks (via update_hash above).
-     * But we re-init'd the ks, so we need to re-feed. For now this
-     * is incomplete — proper handling needs saving the CH bytes. */
-    /* TODO: save CH bytes in tls->sendbuf_early for replay. */
+    /* Replay transcript: ClientHello (from sendbuf_early) + ServerHello. */
+#ifdef TLS_DEBUG
+    printf("[debug] transcript CH: len=%zu, first=%02x %02x %02x %02x\n",
+           tls->sendbuf_early.off, tls->sendbuf_early.base[0],
+           tls->sendbuf_early.base[1], tls->sendbuf_early.base[2],
+           tls->sendbuf_early.base[3]);
+    printf("[debug] transcript SH: len=%zu, first=%02x %02x %02x %02x\n", message.len,
+           message.base[0], message.base[1], message.base[2], message.base[3]);
+#endif
+    cvm_tls_ks_update_hash(&tls->ks, tls->sendbuf_early.base, tls->sendbuf_early.off);
+    cvm_tls_ks_update_hash(&tls->ks, message.base, message.len);
 
-    /* Advance to handshake secret. */
-    ret = cvm_tls_ks_extract(&tls->ks, (CvmTlsVec){NULL, 0}); /* early */
+    /* Compute ECDHE shared secret from server's key_share. */
+    u8 shared_secret[64];
+    usize shared_len = 0;
+    if (tls->keyex_ctx != NULL && sh.key_share.key_exchange.base != NULL) {
+        CvmTlsVec secret_vec = {NULL, 0};
+        ret = tls->keyex_ctx->algo->exchange(tls->keyex_ctx, &secret_vec,
+                                             sh.key_share.key_exchange);
+        if (ret != 0)
+            return ret;
+        shared_len = secret_vec.len;
+        if (shared_len > sizeof(shared_secret))
+            shared_len = sizeof(shared_secret);
+        memcpy(shared_secret, secret_vec.base, shared_len);
+        rt_mem_free((void*)secret_vec.base);
+#ifdef TLS_DEBUG
+        printf("[debug] ECDHE server_pubkey: ");
+        for (int i = 0; i < 8; i++)
+            printf("%02x", sh.key_share.key_exchange.base[i]);
+        printf("... (len=%zu)\n", sh.key_share.key_exchange.len);
+        printf("[debug] ECDHE shared_secret: ");
+        for (int i = 0; i < (int)shared_len; i++)
+            printf("%02x", shared_secret[i]);
+        printf("\n");
+#endif
+    }
+
+    /* Advance key schedule: early secret → handshake secret. */
+    ret = cvm_tls_ks_extract(&tls->ks, (CvmTlsVec){NULL, 0});
     if (ret != 0)
         return ret;
-    ret = cvm_tls_ks_extract(&tls->ks,
-                             (CvmTlsVec){NULL, 0}); /* handshake (no ECDHE yet) */
+    ret = cvm_tls_ks_extract(&tls->ks, shared_len > 0
+                                           ? (CvmTlsVec){shared_secret, shared_len}
+                                           : (CvmTlsVec){NULL, 0});
     if (ret != 0)
         return ret;
 
     /* Derive handshake traffic secrets. */
+#ifdef TLS_DEBUG
+    {
+        u8 th[32];
+        tls->ks.hash_ctx->final(tls->ks.hash_ctx, th, TLS_HASH_FINAL_SNAPSHOT);
+        printf("[debug] transcript_hash: ");
+        for (int i = 0; i < 32; i++)
+            printf("%02x", th[i]);
+        printf("\n");
+    }
+#endif
     ret = cvm_tls_ks_derive_secret(&tls->ks, tls->server_hs_secret, "s hs traffic");
     if (ret != 0)
         return ret;
     ret = cvm_tls_ks_derive_secret(&tls->ks, tls->client_hs_secret, "c hs traffic");
     if (ret != 0)
         return ret;
+    memset(shared_secret, 0, sizeof(shared_secret));
+
+#ifdef TLS_DEBUG
+    printf("[debug] server_hs_secret: ");
+    for (int i = 0; i < 32; i++)
+        printf("%02x", tls->server_hs_secret[i]);
+    printf("\n[debug] client_hs_secret: ");
+    for (int i = 0; i < 32; i++)
+        printf("%02x", tls->client_hs_secret[i]);
+    printf("\n");
+#endif
 
     /* Set up record protection. */
     ret = setup_traffic_protection(tls, false, tls->server_hs_secret, "s hs traffic");
@@ -371,6 +435,10 @@ int cvm_tls_handshake(CvmTls* tls, CvmTlsBuf* sendbuf, void const* input, usize*
             /* Ignore (middlebox compat). */
             continue;
         }
+#ifdef TLS_DEBUG
+        printf("[debug] record type=%u len=%u dec_aead=%p\n", rec.type, rec.length,
+               (void*)tls->dec.aead);
+#endif
         if (rec.type == TLS_CONTENT_TYPE_ALERT) {
             if (rec.length >= 2)
                 return TLS_ERROR_CLASS_ALERT | rec.fragment[1];
@@ -388,6 +456,40 @@ int cvm_tls_handshake(CvmTls* tls, CvmTlsBuf* sendbuf, void const* input, usize*
                 return TLS_ERROR_NO_MEMORY;
             ret = cvm_tls_aead_decrypt(&tls->dec, plaintext, &plaintext_len,
                                        &content_type, rec.fragment, rec.length);
+#ifdef TLS_DEBUG
+            printf("[debug] decrypt seq=%llu len=%u ret=%d first=%02x%02x\n",
+                   (unsigned long long)tls->dec.seq, rec.length, ret,
+                   rec.length > 0 ? rec.fragment[0] : 0,
+                   rec.length > 1 ? rec.fragment[1] : 0);
+            /* Save record for offline analysis */
+            {
+                FILE* df = fopen("/tmp/tls_record.bin", "wb");
+                if (df) {
+                    fwrite(rec.fragment, 1, rec.length, df);
+                    fclose(df);
+                }
+                /* Also save the full input including record header */
+                df = fopen("/tmp/tls_raw.bin", "wb");
+                if (df) {
+                    fwrite(rec.fragment - 5, 1, rec.length + 5, df);
+                    fclose(df);
+                }
+            }
+#endif
+#ifdef TLS_DEBUG
+            if (ret != 0) {
+                /* Dump for offline analysis */
+                printf("[debug] DUMP: key=");
+                /* We can't easily get the key here, but we have traffic iv */
+                printf("iv_unknown ct=");
+                for (int i = 0; i < 32 && i < (int)rec.length; i++)
+                    printf("%02x", rec.fragment[i]);
+                printf("... tag=");
+                for (int i = 0; i < 16; i++)
+                    printf("%02x", rec.fragment[rec.length - 16 + i]);
+                printf("\n");
+            }
+#endif
             if (ret != 0) {
                 rt_mem_free(plaintext);
                 return ret;
@@ -398,10 +500,21 @@ int cvm_tls_handshake(CvmTls* tls, CvmTlsBuf* sendbuf, void const* input, usize*
             content_type = rec.type;
         }
 
+#ifdef TLS_DEBUG
+        printf("[debug] after decrypt: content_type=%u pt_len=%zu first16=",
+               content_type, plaintext_len);
+        for (int i = 0; i < 16 && i < (int)plaintext_len; i++)
+            printf("%02x", plaintext[i]);
+        printf("\n");
+#endif
         if (content_type == TLS_CONTENT_TYPE_HANDSHAKE) {
             /* Parse handshake messages. */
             u8 const* hs = plaintext;
             u8 const* hs_end = plaintext + plaintext_len;
+#ifdef TLS_DEBUG
+            printf("[debug] entering handshake loop: hs=%p end=%p remaining=%ld\n",
+                   (void*)hs, (void*)hs_end, (long)(hs_end - hs));
+#endif
             while (hs < hs_end) {
                 u8 msg_type;
                 CvmTlsVec body;

@@ -104,7 +104,9 @@ function buildTests(toolchain, libObjs) {
     });
 
     const srcs = collect(path.join(ROOT, "tests"), [".c"]).filter(
-        (f) => !f.includes(path.join("tests", "support")),
+        (f) =>
+            !f.includes(path.join("tests", "support")) &&
+            !f.includes(path.join("tests", "integration")),
     );
     if (srcs.length === 0) {
         ui.log("tests: none found");

@@ -26,6 +26,9 @@ HKDF-Extract(., Derive-Secret(., "res master", ...)) ← resumption secret
  */
 
 #include "tls/tls_internal.h"
+#ifdef TLS_DEBUG
+#include <stdio.h>
+#endif
 #include "tls/keyschedule.h"
 #include "base/mem.h"
 #include "base/secure.h"
@@ -220,13 +223,31 @@ int cvm_tls_ks_extract(CvmTlsKeySched* ks, CvmTlsVec ikm) {
                                         (CvmTlsVec){empty_hash, hash->digest_size});
         if (ret != 0)
             return ret;
+#ifdef TLS_DEBUG
+        printf("[debug] derived: ");
+        for (int i = 0; i < (int)hash->digest_size; i++)
+            printf("%02x", derived[i]);
+        printf("\n");
+#endif
         memcpy(ks->secret, derived, hash->digest_size);
         memset(derived, 0, sizeof(derived));
     }
 
     ks->generation++;
+#ifdef TLS_DEBUG
+    printf("[debug] extract gen=%u: ikm_len=%zu, pre_secret=", ks->generation, ikm.len);
+    for (int i = 0; i < (int)hash->digest_size; i++)
+        printf("%02x", ks->secret[i]);
+    printf("\n");
+#endif
     ret = cvm_tls_hkdf_extract(hash, ks->secret,
                                (CvmTlsVec){ks->secret, hash->digest_size}, ikm);
+#ifdef TLS_DEBUG
+    printf("[debug] extract gen=%u: post_secret=", ks->generation);
+    for (int i = 0; i < (int)hash->digest_size; i++)
+        printf("%02x", ks->secret[i]);
+    printf("\n");
+#endif
     return ret;
 }
 

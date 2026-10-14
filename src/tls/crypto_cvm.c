@@ -46,8 +46,15 @@ static void cvm_sha256_update(CvmTlsHash* _ctx, void const* src, usize len) {
 
 static void cvm_sha256_final(CvmTlsHash* _ctx, void* digest, CvmTlsHashFinalMode mode) {
     Sha256Tls* ctx = (Sha256Tls*)_ctx;
-    if (digest != NULL)
-        cvmcrypt_sha256_final(&ctx->ctx, digest);
+    if (digest != NULL) {
+        if (mode == TLS_HASH_FINAL_SNAPSHOT) {
+            /* Work on a copy — the underlying final resets the state. */
+            CvmcryptSha256 copy = ctx->ctx;
+            cvmcrypt_sha256_final(&copy, digest);
+        } else {
+            cvmcrypt_sha256_final(&ctx->ctx, digest);
+        }
+    }
     if (mode == TLS_HASH_FINAL_RESET)
         cvmcrypt_sha256_init(&ctx->ctx);
     else if (mode == TLS_HASH_FINAL_FREE)
@@ -90,8 +97,14 @@ static void cvm_sha384_update(CvmTlsHash* _ctx, void const* src, usize len) {
 
 static void cvm_sha384_final(CvmTlsHash* _ctx, void* digest, CvmTlsHashFinalMode mode) {
     Sha384Tls* ctx = (Sha384Tls*)_ctx;
-    if (digest != NULL)
-        cvmcrypt_sha384_final(&ctx->ctx, digest);
+    if (digest != NULL) {
+        if (mode == TLS_HASH_FINAL_SNAPSHOT) {
+            CvmcryptSha512 copy = ctx->ctx;
+            cvmcrypt_sha384_final(&copy, digest);
+        } else {
+            cvmcrypt_sha384_final(&ctx->ctx, digest);
+        }
+    }
     if (mode == TLS_HASH_FINAL_RESET)
         cvmcrypt_sha384_init(&ctx->ctx);
     else if (mode == TLS_HASH_FINAL_FREE)
@@ -318,20 +331,38 @@ static void cvm_x25519_dispose(CvmTlsKeyexCtx* _ctx) {
 }
 
 static int cvm_x25519_create(CvmTlsKeyexCtx** _ctx);
+static int cvm_x25519_exchange(CvmTlsKeyexCtx* _ctx, CvmTlsVec* secret,
+                               CvmTlsVec peer_pubkey);
 
-static CvmTlsKeyexAlgo const CVM_TLS_X25519 = {
+static CvmTlsKeyexAlgo const CVM_TLS_X25519_ALGO = {
     .name = "x25519",
     .id = TLS_GROUP_X25519,
     .shared_secret_size = 32,
     .create = cvm_x25519_create,
+    .exchange = cvm_x25519_exchange,
 };
+
+/* Compute shared secret: X25519(our_private, peer_public). */
+static int cvm_x25519_exchange(CvmTlsKeyexCtx* _ctx, CvmTlsVec* secret,
+                               CvmTlsVec peer_pubkey) {
+    X25519Ctx* ctx = (X25519Ctx*)_ctx;
+    if (peer_pubkey.len != 32)
+        return TLS_ALERT_ILLEGAL_PARAMETER;
+    u8* shared = rt_mem_alloc(32);
+    if (!shared)
+        return TLS_ERROR_NO_MEMORY;
+    cvmcrypt_x25519(shared, ctx->private_key, peer_pubkey.base);
+    secret->base = shared;
+    secret->len = 32;
+    return 0;
+}
 
 static int cvm_x25519_create(CvmTlsKeyexCtx** _ctx) {
     X25519Ctx* ctx = rt_mem_alloc(sizeof(*ctx));
     if (ctx == NULL)
         return TLS_ERROR_NO_MEMORY;
     memset(ctx, 0, sizeof(*ctx));
-    ctx->super.algo = &CVM_TLS_X25519;
+    ctx->super.algo = &CVM_TLS_X25519_ALGO;
     ctx->super.dispose = cvm_x25519_dispose;
 
     for (int i = 0; i < 32; i++)
@@ -384,7 +415,7 @@ static CvmTlsCipherSuite const* const CVM_CIPHER_SUITES[] = {
 };
 
 static CvmTlsKeyexAlgo const* CVM_KEY_EXCHANGES[] = {
-    &CVM_TLS_X25519,
+    &CVM_TLS_X25519_ALGO,
     NULL,
 };
 

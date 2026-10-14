@@ -200,6 +200,16 @@ bool cvmcrypt_gcm_encrypt(CvmcryptGcm* g, u8 const* key, usize keylen, u8 const 
         ghash_update(g, aad, aadlen, &g->aadlen);
     }
 
+    /* Pad AAD to block boundary before ciphertext. */
+    if (g->buflen > 0) {
+        memset(g->buf + g->buflen, 0, 16 - g->buflen);
+        for (usize i = 0; i < 16; i++) {
+            g->X[i] ^= g->buf[i];
+        }
+        gf128_mul(g->X, g->H, g->X, g->impl);
+        g->buflen = 0;
+    }
+
     /* Save J0 for the tag. */
     u8 j0[16];
     memcpy(j0, g->counter, 16);
@@ -240,6 +250,17 @@ bool cvmcrypt_gcm_decrypt(CvmcryptGcm* g, u8 const* key, usize keylen, u8 const 
     /* Absorb AAD. */
     if (aad && aadlen > 0) {
         ghash_update(g, aad, aadlen, &g->aadlen);
+    }
+
+    /* Pad AAD to block boundary before ciphertext (per SP 800-38D:
+     * GHASH input = A || 0^v || C || 0^u || lengths). */
+    if (g->buflen > 0) {
+        memset(g->buf + g->buflen, 0, 16 - g->buflen);
+        for (usize i = 0; i < 16; i++) {
+            g->X[i] ^= g->buf[i];
+        }
+        gf128_mul(g->X, g->H, g->X, g->impl);
+        g->buflen = 0;
     }
 
     /* Absorb the ciphertext into GHASH (before decrypting). */
