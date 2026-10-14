@@ -53,89 +53,126 @@ void gf128_mul_scalar(u8 const* a, u8 const* b, u8* out) {
 #if defined(__aarch64__)
 #include <arm_neon.h>
 
-/* 64-bit bit reversal via ARM64 rbit instruction. */
-__attribute__((target("crypto"))) static inline uint64_t rbit64(uint64_t v) {
-    uint64_t r;
-    __asm__("rbit %0, %1" : "=r"(r) : "r"(v));
-    return r;
-}
-
-/* Full 128-bit bit reversal: swap 64-bit halves + rbit each.
- * Converts GHASH bit-reflected order to PMULL natural order. */
-__attribute__((target("crypto"))) static inline uint64x2_t bitrev128(uint64x2_t v) {
-    uint64_t lo = vgetq_lane_u64(v, 0);
-    uint64_t hi = vgetq_lane_u64(v, 1);
-    uint64x2_t r = {rbit64(hi), rbit64(lo)};
-    return r;
-}
-
-/* GHASH multiply using PMULL.
- * GHASH uses bit-reflected order (leftmost bit = x^0).
- * PMULL uses natural order (LSB = x^0).
- * We rbit both inputs, multiply in natural order, rbit the result.
- * Reduction in natural order: x^128 == x^7+x^2+x+1 = 0x87. */
-__attribute__((target("crypto"))) void gf128_mul_pmull(u8 const* a, u8 const* b,
-                                                       u8* out) {
-    uint8x16_t va = vld1q_u8(a);
-    uint8x16_t vb = vld1q_u8(b);
-
-    /* GHASH big-endian bytes -> LE u64x2. */
-    va = vrev64q_u8(va);
-    va = vextq_u8(va, va, 8);
+/* NEON-native 128-bit bit reversal (no NEON↔ARM transfers).
+ * Converts GHASH reflected order to PMULL natural order. */
+__attribute__((target("crypto"))) static inline uint64x2_t
+bitrev128_neon(uint64x2_t v) {
+    uint64x2_t m1 = vdupq_n_u64(0x5555555555555555ULL);
+    uint64x2_t m2 = vdupq_n_u64(0x3333333333333333ULL);
+    uint64x2_t m3 = vdupq_n_u64(0x0F0F0F0F0F0F0F0FULL);
+    /* Reverse bits within each byte (3 shift-mask rounds). */
+    v = vorrq_u64(vshlq_n_u64(vandq_u64(v, m1), 1), vandq_u64(vshrq_n_u64(v, 1), m1));
+    v = vorrq_u64(vshlq_n_u64(vandq_u64(v, m2), 2), vandq_u64(vshrq_n_u64(v, 2), m2));
+    v = vorrq_u64(vshlq_n_u64(vandq_u64(v, m3), 4), vandq_u64(vshrq_n_u64(v, 4), m3));
+    /* Reverse bytes + swap halves = full 128-bit reversal. */
+    uint8x16_t vb = vreinterpretq_u8_u64(v);
     vb = vrev64q_u8(vb);
     vb = vextq_u8(vb, vb, 8);
+    return vreinterpretq_u64_u8(vb);
+}
 
-    /* Full bit reversal: GHASH reflected -> PMULL natural. */
-    uint64x2_t a64 = bitrev128(vreinterpretq_u64_u8(va));
-    uint64x2_t b64 = bitrev128(vreinterpretq_u64_u8(vb));
+/* Load a GHASH block (big-endian bytes) and convert to natural PMULL order. */
+__attribute__((target("crypto"))) static inline uint64x2_t nat_load(u8 const* p) {
+    uint8x16_t v = vld1q_u8(p);
+    v = vrev64q_u8(v);
+    v = vextq_u8(v, v, 8);
+    return bitrev128_neon(vreinterpretq_u64_u8(v));
+}
 
-    uint64_t a_lo = vgetq_lane_u64(a64, 0);
-    uint64_t a_hi = vgetq_lane_u64(a64, 1);
-    uint64_t b_lo = vgetq_lane_u64(b64, 0);
-    uint64_t b_hi = vgetq_lane_u64(b64, 1);
+/* Store natural order result back to GHASH big-endian bytes. */
+__attribute__((target("crypto"))) static inline void nat_store(u8* p, uint64x2_t v) {
+    uint64x2_t rv = bitrev128_neon(v);
+    uint8x16_t vb = vreinterpretq_u8_u64(rv);
+    vb = vextq_u8(vb, vb, 8);
+    vb = vrev64q_u8(vb);
+    vst1q_u8(p, vb);
+}
 
-    /* Karatsuba 128x128 carryless multiply (3 PMULLs). */
-    poly128_t pl = vmull_p64(a_lo, b_lo);
-    poly128_t ph = vmull_p64(a_hi, b_hi);
-    poly128_t pm = vmull_p64(a_lo ^ a_hi, b_lo ^ b_hi);
-
+/* 128×128 carry-less multiplication (Karatsuba, 3 PMULLs).
+ * Output: 256-bit product as (lo, hi). */
+__attribute__((target("crypto"))) static inline void
+pmull_128(uint64x2_t a, uint64x2_t b, uint64x2_t* lo, uint64x2_t* hi) {
+    uint64_t a0 = vgetq_lane_u64(a, 0), a1 = vgetq_lane_u64(a, 1);
+    uint64_t b0 = vgetq_lane_u64(b, 0), b1 = vgetq_lane_u64(b, 1);
+    poly128_t pl = vmull_p64(a0, b0);
+    poly128_t ph = vmull_p64(a1, b1);
+    poly128_t pm = vmull_p64(a0 ^ a1, b0 ^ b1);
     uint64x2_t vl = vreinterpretq_u64_p128(pl);
     uint64x2_t vh = vreinterpretq_u64_p128(ph);
     uint64x2_t vm = vreinterpretq_u64_p128(pm);
-
     vm = veorq_u64(vm, vl);
     vm = veorq_u64(vm, vh);
-
     uint64_t d0 = vgetq_lane_u64(vl, 0);
     uint64_t d1 = vgetq_lane_u64(vl, 1) ^ vgetq_lane_u64(vm, 0);
     uint64_t d2 = vgetq_lane_u64(vh, 0) ^ vgetq_lane_u64(vm, 1);
     uint64_t d3 = vgetq_lane_u64(vh, 1);
-
-    /* Reduction (natural order, R = 0x87). */
-    {
-        poly128_t t3 = vmull_p64(d3, 0x87);
-        uint64x2_t v3 = vreinterpretq_u64_p128(t3);
-        d1 ^= vgetq_lane_u64(v3, 0);
-        d2 ^= vgetq_lane_u64(v3, 1);
-    }
-    {
-        poly128_t t2 = vmull_p64(d2, 0x87);
-        uint64x2_t v2 = vreinterpretq_u64_p128(t2);
-        d0 ^= vgetq_lane_u64(v2, 0);
-        d1 ^= vgetq_lane_u64(v2, 1);
-    }
-
-    uint64x2_t result_nat = {d0, d1};
-
-    /* Bit-reverse back to GHASH order. */
-    uint64x2_t result_ghash = bitrev128(result_nat);
-
-    /* LE u64x2 -> GHASH big-endian bytes. */
-    uint8x16_t out_vec = vreinterpretq_u8_u64(result_ghash);
-    out_vec = vextq_u8(out_vec, out_vec, 8);
-    out_vec = vrev64q_u8(out_vec);
-    vst1q_u8(out, out_vec);
+    uint64x2_t r0 = vcombine_u64(vcreate_u64(d0), vcreate_u64(d1));
+    uint64x2_t r1 = vcombine_u64(vcreate_u64(d2), vcreate_u64(d3));
+    *lo = r0;
+    *hi = r1;
 }
+
+/* Reduce 256-bit product to 128 bits (natural order, R = 0x87). */
+__attribute__((target("crypto"))) static inline uint64x2_t pmull_reduce(uint64x2_t lo,
+                                                                        uint64x2_t hi) {
+    uint64_t d0 = vgetq_lane_u64(lo, 0), d1 = vgetq_lane_u64(lo, 1);
+    uint64_t d2 = vgetq_lane_u64(hi, 0), d3 = vgetq_lane_u64(hi, 1);
+    { /* fold d3 */
+        poly128_t t = vmull_p64(d3, 0x87);
+        uint64x2_t vt = vreinterpretq_u64_p128(t);
+        d1 ^= vgetq_lane_u64(vt, 0);
+        d2 ^= vgetq_lane_u64(vt, 1);
+    }
+    { /* fold d2 */
+        poly128_t t = vmull_p64(d2, 0x87);
+        uint64x2_t vt = vreinterpretq_u64_p128(t);
+        d0 ^= vgetq_lane_u64(vt, 0);
+        d1 ^= vgetq_lane_u64(vt, 1);
+    }
+    return vcombine_u64(vcreate_u64(d0), vcreate_u64(d1));
+}
+
+/* Single gf128 multiply (for compatibility + H power computation). */
+__attribute__((target("crypto"))) void gf128_mul_pmull(u8 const* a, u8 const* b,
+                                                       u8* out) {
+    uint64x2_t av = nat_load(a);
+    uint64x2_t bv = nat_load(b);
+    uint64x2_t lo, hi;
+    pmull_128(av, bv, &lo, &hi);
+    uint64x2_t result = pmull_reduce(lo, hi);
+    nat_store(out, result);
+}
+
+#if defined(__aarch64__)
+/* 4-block aggregated GHASH (the hot path).
+ * Precomputed H^1..H^4 allow processing 4 blocks with 12 PMULLs
+ * and a single reduction (vs 20 PMULLs for sequential). */
+__attribute__((target("crypto"))) static void ghash_4blocks(CvmcryptGcm* g,
+                                                            u8 const* data) {
+    uint64x2_t h1 = vld1q_u64((uint64_t const*)g->H_nat[0]);
+    uint64x2_t h2 = vld1q_u64((uint64_t const*)g->H_nat[1]);
+    uint64x2_t h3 = vld1q_u64((uint64_t const*)g->H_nat[2]);
+    uint64x2_t h4 = vld1q_u64((uint64_t const*)g->H_nat[3]);
+    uint64x2_t x1 = nat_load(data);
+    uint64x2_t x2 = nat_load(data + 16);
+    uint64x2_t x3 = nat_load(data + 32);
+    uint64x2_t x4 = nat_load(data + 48);
+    uint64x2_t acc = vld1q_u64((uint64_t const*)g->X_nat);
+    acc = veorq_u64(acc, x1);
+
+    uint64x2_t lo1, hi1, lo2, hi2, lo3, hi3, lo4, hi4;
+    pmull_128(acc, h4, &lo1, &hi1); /* (Y⊕X1)·H^4 */
+    pmull_128(x2, h3, &lo2, &hi2);  /* X2·H^3 */
+    pmull_128(x3, h2, &lo3, &hi3);  /* X3·H^2 */
+    pmull_128(x4, h1, &lo4, &hi4);  /* X4·H^1 */
+
+    uint64x2_t lo_s = veorq_u64(veorq_u64(lo1, lo2), veorq_u64(lo3, lo4));
+    uint64x2_t hi_s = veorq_u64(veorq_u64(hi1, hi2), veorq_u64(hi3, hi4));
+
+    uint64x2_t result = pmull_reduce(lo_s, hi_s);
+    vst1q_u64((uint64_t*)g->X_nat, result);
+}
+#endif
 #endif
 
 /* Dispatch: use PMULL on aarch64, scalar elsewhere. */
@@ -165,6 +202,23 @@ static void ghash_update(CvmcryptGcm* g, u8 const* data, usize len, u64* total_b
     /* Absorb data into the GHASH accumulator, buffering partial blocks. */
     *total_bits += len * 8;
 
+#if defined(__aarch64__)
+    /* Fast path: 4-block aggregated GHASH with precomputed H powers. */
+    if (g->impl == CVMCRYPT_GCM_IMPL_PMULL && g->buflen == 0 && len >= 64) {
+        /* Sync X_nat from g->X before fast path (in case slow path ran first). */
+        uint64x2_t xn = nat_load(g->X);
+        vst1q_u64((uint64_t*)g->X_nat, xn);
+        usize num4 = len / 64;
+        for (usize i = 0; i < num4; i++) {
+            ghash_4blocks(g, data);
+            data += 64;
+            len -= 64;
+        }
+        /* Always sync g->X from X_nat after fast path. */
+        nat_store(g->X, vld1q_u64((uint64_t const*)g->X_nat));
+    }
+#endif
+
     while (len > 0) {
         usize n = 16 - g->buflen;
         if (n > len)
@@ -180,6 +234,13 @@ static void ghash_update(CvmcryptGcm* g, u8 const* data, usize len, u64* total_b
                 g->X[i] ^= g->buf[i];
             }
             gf128_mul(g->X, g->H, g->X, g->impl);
+            /* Sync natural-order accumulator. */
+#if defined(__aarch64__)
+            if (g->impl == CVMCRYPT_GCM_IMPL_PMULL) {
+                uint64x2_t xn = nat_load(g->X);
+                vst1q_u64((uint64_t*)g->X_nat, xn);
+            }
+#endif
             g->buflen = 0;
         }
     }
@@ -228,6 +289,7 @@ static bool gcm_setup(CvmcryptGcm* g, u8 const* key, usize keylen, u8 const iv[1
 
     /* Reset the accumulator. */
     memset(g->X, 0, 16);
+    memset(g->X_nat, 0, 16);
     g->buflen = 0;
     g->aadlen = 0;
     g->ptlen = 0;
@@ -237,10 +299,93 @@ static bool gcm_setup(CvmcryptGcm* g, u8 const* key, usize keylen, u8 const iv[1
 #else
     g->impl = CVMCRYPT_GCM_IMPL_SCALAR;
 #endif
+
+#if defined(__aarch64__)
+    /* Precompute H^1..H^4 in natural polynomial order for 4-block GHASH. */
+    if (g->impl == CVMCRYPT_GCM_IMPL_PMULL) {
+        u8 hp2[16], hp3[16], hp4[16];
+        gf128_mul_pmull(g->H, g->H, hp2); /* hp2 = H^2 */
+        gf128_mul_pmull(hp2, g->H, hp3);  /* hp3 = H^3 */
+        gf128_mul_pmull(hp2, hp2, hp4);   /* hp4 = H^4 */
+        uint64x2_t h1v = nat_load(g->H);
+        uint64x2_t h2v = nat_load(hp2);
+        uint64x2_t h3v = nat_load(hp3);
+        uint64x2_t h4v = nat_load(hp4);
+        vst1q_u64((uint64_t*)g->H_nat[0], h1v);
+        vst1q_u64((uint64_t*)g->H_nat[1], h2v);
+        vst1q_u64((uint64_t*)g->H_nat[2], h3v);
+        vst1q_u64((uint64_t*)g->H_nat[3], h4v);
+    }
+#endif
+
     return true;
 }
 
+/* Batched AES-CTR: encrypt 4 blocks in parallel.
+ * Pre-computes 4 counters, AES-encrypts them simultaneously (pipelined),
+ * then XORs with input. Amortizes counter increment over 4 blocks. */
+__attribute__((target("crypto"))) static void gcm_crypt_4(CvmcryptGcm* g, u8 const* in,
+                                                          u8* out) {
+    /* Load AES round keys. */
+    uint8x16_t rk[11];
+    for (int r = 0; r <= 10; r++) {
+        rk[r] = vld1q_u8((u8 const*)&g->aes.enc[4 * r]);
+    }
+
+    /* Generate 4 counters (ctr, ctr+1, ctr+2, ctr+3). */
+    uint8x16_t c0 = vld1q_u8(g->counter);
+    uint8x16_t c1 = c0, c2 = c0, c3 = c0;
+
+    /* Increment last 32 bits (big-endian) for c1, c2, c3. */
+    /* Use scalar: read last 4 bytes, add 1/2/3, write back. */
+    {
+        u32 be;
+        memcpy(&be, g->counter + 12, 4);
+        be = __builtin_bswap32(be); /* to host order */
+        u32 b1 = __builtin_bswap32(be + 1);
+        u32 b2 = __builtin_bswap32(be + 2);
+        u32 b3 = __builtin_bswap32(be + 3);
+        u32 b4 = __builtin_bswap32(be + 4);
+        memcpy((u8*)&c1 + 12, &b1, 4);
+        memcpy((u8*)&c2 + 12, &b2, 4);
+        memcpy((u8*)&c3 + 12, &b3, 4);
+        memcpy(g->counter + 12, &b4, 4); /* update for next batch */
+    }
+
+    /* AES-encrypt all 4 counters (interleaved for pipeline). */
+    uint8x16_t s0 = c0, s1 = c1, s2 = c2, s3 = c3;
+    for (int r = 0; r < 9; r++) {
+        s0 = vaesmcq_u8(vaeseq_u8(s0, rk[r]));
+        s1 = vaesmcq_u8(vaeseq_u8(s1, rk[r]));
+        s2 = vaesmcq_u8(vaeseq_u8(s2, rk[r]));
+        s3 = vaesmcq_u8(vaeseq_u8(s3, rk[r]));
+    }
+    s0 = veorq_u8(vaeseq_u8(s0, rk[9]), rk[10]);
+    s1 = veorq_u8(vaeseq_u8(s1, rk[9]), rk[10]);
+    s2 = veorq_u8(vaeseq_u8(s2, rk[9]), rk[10]);
+    s3 = veorq_u8(vaeseq_u8(s3, rk[9]), rk[10]);
+
+    /* XOR with input, store output. */
+    uint8x16_t p0 = vld1q_u8(in);
+    uint8x16_t p1 = vld1q_u8(in + 16);
+    uint8x16_t p2 = vld1q_u8(in + 32);
+    uint8x16_t p3 = vld1q_u8(in + 48);
+    vst1q_u8(out, veorq_u8(p0, s0));
+    vst1q_u8(out + 16, veorq_u8(p1, s1));
+    vst1q_u8(out + 32, veorq_u8(p2, s2));
+    vst1q_u8(out + 48, veorq_u8(p3, s3));
+}
+
 static void gcm_crypt(CvmcryptGcm* g, u8 const* in, usize len, u8* out) {
+#if defined(__aarch64__)
+    /* Fast path: 4 blocks with parallel AES (pipelined vaeseq). */
+    while (len >= 64) {
+        gcm_crypt_4(g, in, out);
+        in += 64;
+        out += 64;
+        len -= 64;
+    }
+#endif
     /* GCTR per SP 800-38D: the first block uses the counter as-is
      * (already set to ICB), subsequent blocks increment. */
     u8 block[16];
