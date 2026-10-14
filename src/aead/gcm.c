@@ -437,10 +437,10 @@ bool cvmcrypt_gcm_encrypt(CvmcryptGcm* g, u8 const* key, usize keylen, u8 const 
      * counter as-is for the first block (no pre-increment). */
     increment_counter(g->counter);
 
-    /* Encrypt. */
+    /* Encrypt (CTR mode with 4-block batched AES). */
     gcm_crypt(g, pt, ptlen, ct);
 
-    /* Absorb the ciphertext into GHASH. */
+    /* Absorb the ciphertext into GHASH (4-block aggregated). */
     if (ct && ptlen > 0) {
         ghash_update(g, ct, ptlen, &g->ptlen);
     }
