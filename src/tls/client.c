@@ -99,12 +99,11 @@ static int client_send_client_hello(CvmTls* tls, CvmTlsBuf* sendbuf) {
     if (ret != 0)
         return ret;
 
-    /* Get our public key. */
-    /* The create callback generates a keypair; we need the public key.
-     * For X25519, the public key is stored in the context. */
-    /* HACK: for now, use a zero pubkey — the crypto layer (t43) will fix this. */
-    memset(tls->keyex_pubkey, 0, 32);
-    tls->keyex_pubkey_len = 32;
+    /* Get our public key from the keyex context. */
+    tls->keyex_pubkey_len = tls->keyex_ctx->pubkey_len;
+    if (tls->keyex_pubkey_len > sizeof(tls->keyex_pubkey))
+        tls->keyex_pubkey_len = sizeof(tls->keyex_pubkey);
+    memcpy(tls->keyex_pubkey, tls->keyex_ctx->pubkey, tls->keyex_pubkey_len);
 
     /* Write record header. */
     usize rec_start = sendbuf->off;

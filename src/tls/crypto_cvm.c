@@ -342,6 +342,10 @@ static int cvm_x25519_create(CvmTlsKeyexCtx** _ctx) {
 
     cvmcrypt_x25519_base(ctx->public_key, ctx->private_key);
 
+    /* Export the public key to the generic field. */
+    memcpy(ctx->super.pubkey, ctx->public_key, 32);
+    ctx->super.pubkey_len = 32;
+
     *_ctx = &ctx->super;
     return 0;
 }

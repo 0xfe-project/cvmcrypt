@@ -61,6 +61,17 @@ static void fix_block16(CvmTlsBuf* buf, usize start) {
     buf->base[start + 1] = (u8)len;
 }
 
+static int push_vec8(CvmTlsBuf* buf, CvmTlsVec v) {
+    int ret;
+    if (v.len > 255)
+        return TLS_ERROR_LIBRARY;
+    if ((ret = cvm_tls_buf_push(buf, (u8)v.len)) != 0)
+        return ret;
+    if ((ret = cvm_tls_buf_pushv(buf, v.base, v.len)) != 0)
+        return ret;
+    return 0;
+}
+
 static int push_vec16(CvmTlsBuf* buf, CvmTlsVec v) {
     int ret;
     if (v.len > 65535)
@@ -107,7 +118,7 @@ int cvm_tls_encode_client_hello(CvmTlsBuf* buf,
         return ret;
 
     /* legacy_session_id. */
-    if ((ret = push_vec16(buf, legacy_session_id)) != 0)
+    if ((ret = push_vec8(buf, legacy_session_id)) != 0)
         return ret;
 
     /* cipher_suites. */
@@ -306,7 +317,7 @@ int cvm_tls_encode_server_hello(CvmTlsBuf* buf, CvmTlsCipherSuite const* suite,
         return ret;
 
     /* legacy_session_id (echo). */
-    if ((ret = push_vec16(buf, legacy_session_id)) != 0)
+    if ((ret = push_vec8(buf, legacy_session_id)) != 0)
         return ret;
 
     /* cipher_suite. */
@@ -520,13 +531,16 @@ int cvm_tls_decode_client_hello(CvmTlsClientHello* ch, u8 const* src, u8 const* 
         return TLS_ERROR_DECODE;
     memcpy(ch->random, p, 32);
     p += 32;
-    if (tls_decode16(&len, &p, end) != 0)
-        return TLS_ERROR_DECODE;
-    if (p + len > end)
-        return TLS_ERROR_DECODE;
-    ch->legacy_session_id.base = p;
-    ch->legacy_session_id.len = len;
-    p += len;
+    { /* legacy_session_id (1-byte length) */
+        u8 sid_len;
+        if (tls_decode8(&sid_len, &p, end) != 0)
+            return TLS_ERROR_DECODE;
+        if (p + sid_len > end)
+            return TLS_ERROR_DECODE;
+        ch->legacy_session_id.base = p;
+        ch->legacy_session_id.len = sid_len;
+        p += sid_len;
+    }
     if (tls_decode16(&len, &p, end) != 0)
         return TLS_ERROR_DECODE;
     for (usize i = 0; i < len / 2 && i < 16; i++) {
@@ -604,13 +618,16 @@ int cvm_tls_decode_server_hello(CvmTlsServerHello* sh, u8 const* src, u8 const* 
     memcpy(sh->random, p, 32);
     p += 32;
     sh->is_hello_retry_request = memcmp(sh->random, HRR_RANDOM, 32) == 0;
-    if (tls_decode16(&len, &p, end) != 0)
-        return TLS_ERROR_DECODE;
-    if (p + len > end)
-        return TLS_ERROR_DECODE;
-    sh->legacy_session_id.base = p;
-    sh->legacy_session_id.len = len;
-    p += len;
+    { /* legacy_session_id (1-byte length) */
+        u8 sid_len;
+        if (tls_decode8(&sid_len, &p, end) != 0)
+            return TLS_ERROR_DECODE;
+        if (p + sid_len > end)
+            return TLS_ERROR_DECODE;
+        sh->legacy_session_id.base = p;
+        sh->legacy_session_id.len = sid_len;
+        p += sid_len;
+    }
     if (tls_decode16(&sh->cipher_suite, &p, end) != 0)
         return TLS_ERROR_DECODE;
     if (tls_decode8(&comp, &p, end) != 0)

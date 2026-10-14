@@ -224,6 +224,8 @@ typedef struct CvmTlsKeyexAlgo {
 struct CvmTlsKeyexCtx {
     CvmTlsKeyexAlgo const* algo;
     void (*dispose)(CvmTlsKeyexCtx* ctx);
+    u8 pubkey[64]; /* our ephemeral public key (uncompressed point or raw) */
+    usize pubkey_len;
 };
 
 /* Cipher suite = AEAD + hash + ID. */
