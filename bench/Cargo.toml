@@ -1,0 +1,11 @@
+[package]
+name = "bench_rust"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+ring = "0.17"
+
+[profile.release]
+opt-level = 3
+lto = true
