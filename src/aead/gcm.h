@@ -27,7 +27,7 @@ typedef struct CvmcryptGcm {
     u8 X[16];
     /* Precomputed H powers in natural polynomial order (for PMULL).
      * H1=H, H2=H², H3=H³, H4=H⁴ — used for 4-block aggregated GHASH. */
-    u8 H_nat[4][16];
+    u8 H_nat[8][16];
     /* Accumulator in natural polynomial order (PMULL fast path). */
     u8 X_nat[16];
     /* The counter block: J0 padded to 16 bytes. */
