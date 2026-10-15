@@ -224,7 +224,7 @@ int main(int argc, char** argv) {
         u8 priv[32], pub[32], shared[32], peer[32];
         memset(priv, 0x42, 32);
         priv[0] &= 248; priv[31] &= 127; priv[31] |= 64;
-        cvmcrypt_x25519_base(pub, priv);
+        cvmcrypt_x25519_base_fast(pub, priv);
         memcpy(peer, pub, 32);
 
         int const N = 1000;
@@ -232,7 +232,7 @@ int main(int argc, char** argv) {
         for (int r = 0; r < 3; r++) {
             double t0 = now_ms();
             for (int i = 0; i < N; i++)
-                cvmcrypt_x25519(shared, priv, peer);
+                cvmcrypt_x25519_fast(shared, priv, peer);
             double t1 = now_ms();
             if (t1 - t0 < best) best = t1 - t0;
         }
@@ -278,9 +278,9 @@ int main(int argc, char** argv) {
                 u8 priv[32], pub[32], shared[32], peer[32];
                 memset(priv, 0x42, 32);
                 priv[0] &= 248; priv[31] &= 127; priv[31] |= 64;
-                cvmcrypt_x25519_base(pub, priv);
+                cvmcrypt_x25519_base_fast(pub, priv);
                 memcpy(peer, pub, 32);
-                cvmcrypt_x25519(shared, priv, peer);
+                cvmcrypt_x25519_fast(shared, priv, peer);
 
                 /* Key schedule: extract → extract → derive → keys */
                 /* (simplified: just HKDF-Extract twice + expand) */
