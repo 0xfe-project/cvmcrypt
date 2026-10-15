@@ -448,19 +448,20 @@ gcm_crypt_hash_loop(CvmcryptGcm* g, u8 const* in, u8* out, usize nbytes) {
     while (nbytes >= 128) {
         nbytes -= 128;
 
-        /* Generate 8 counter blocks — PURE NEON, no pointer aliasing. */
-        uint32x4_t ctr0 = vld1q_u32((uint32_t const*)(void const*)g->counter);
-        u32 be = __builtin_bswap32(vgetq_lane_u32(ctr0, 3));
+        /* Generate 8 counters via NEON VADD chain (Go's approach).
+         * CTR in native u32; VREV32 converts to/from BE bytes. */
+        uint32x4_t inc = vdupq_n_u32(0);
+        inc = vsetq_lane_u32(1, inc, 3);
+        uint32x4_t cn = vreinterpretq_u32_u8(vrev32q_u8(vld1q_u8(g->counter)));
+        uint32x4_t c[8];
+        c[0] = cn;
+        for (int i = 1; i < 8; i++)
+            c[i] = vaddq_u32(c[i - 1], inc);
+        cn = vaddq_u32(c[7], inc); /* for next iteration */
+        vst1q_u8(g->counter, vrev32q_u8(vreinterpretq_u8_u32(cn)));
         uint8x16_t ctr[8];
-        for (int i = 0; i < 8; i++) {
-            u32 v = __builtin_bswap32(be + (u32)i);
-            uint32x4_t t = vsetq_lane_u32(v, ctr0, 3);
-            ctr[i] = vreinterpretq_u8_u32(t);
-        }
-        {
-            u32 nb = __builtin_bswap32(be + 8);
-            memcpy(g->counter + 12, &nb, 4); /* plain memory, OK to memcpy */
-        }
+        for (int i = 0; i < 8; i++)
+            ctr[i] = vrev32q_u8(vreinterpretq_u8_u32(c[i]));
 
         /* AES-encrypt all 8 counters (interleaved). */
         uint8x16_t s[8];
