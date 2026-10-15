@@ -25,11 +25,14 @@ typedef struct CvmcryptGcm {
     u8 H[16];
     /* Running GHASH accumulator. */
     u8 X[16];
-    /* Precomputed H powers in natural polynomial order (for PMULL).
-     * H1=H, H2=H², H3=H³, H4=H⁴ — used for 4-block aggregated GHASH. */
-    u8 H_nat[8][16];
-    /* Accumulator in natural polynomial order (PMULL fast path). */
-    u8 X_nat[16];
+    /* Reflected-domain power table (Go gcm_arm64.s style):
+     * entry[i] = {power, power ⊕ swap(power)}, 32 bytes each.
+     * entry[7] = 2H (doubled, NOT swapped); entries 6..0 store
+     * swap(P) where P = next power — this asymmetry is part of
+     * the algorithm. Used by the reflected-domain GHASH fast path. */
+    u8 H_refl[8][32];
+    /* Reflected-domain accumulator (VREV64 of running GHASH X). */
+    u8 X_refl[16];
     /* The counter block: J0 padded to 16 bytes. */
     u8 counter[16];
     /* Buffered partial block. */

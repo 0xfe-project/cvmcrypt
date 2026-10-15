@@ -53,138 +53,192 @@ void gf128_mul_scalar(u8 const* a, u8 const* b, u8* out) {
 #if defined(__aarch64__)
 #include <arm_neon.h>
 
-/* Load a GHASH block (big-endian bytes) and convert to natural PMULL order. */
-__attribute__((target("crypto"))) static inline uint64x2_t nat_load(u8 const* p) {
-    /* Within-byte bit reversal via 4-bit lookup table (vqtbl1q).
-     * 6 instructions vs 15 for 3-round shift-mask.
-     *
-     * Correctness: GHASH BE bytes loaded as LE u64 pairs.
-     * Byte 0 has x^0..x^7 (MSB→LSB). LE puts byte 0 in low byte.
-     * Only need bit reversal within each byte (x^0 → bit 0).
-     *
-     * Table: rev4[n] = bit-reverse of 4-bit n.
-     * byte b = hi*16+lo → reversed = (rev4[lo]<<4) | rev4[hi]. */
-    static const uint8_t rev4_tab[16] = {0, 8, 4, 12, 2, 10, 6, 14,
-                                         1, 9, 5, 13, 3, 11, 7, 15};
-    uint8x16_t table = vld1q_u8(rev4_tab);
-    uint8x16_t v = vld1q_u8(p);
-    uint8x16_t lo = vandq_u8(v, vdupq_n_u8(0x0F));
-    uint8x16_t hi = vshrq_n_u8(v, 4);
-    uint8x16_t rlo = vqtbl1q_u8(table, lo);
-    uint8x16_t rhi = vqtbl1q_u8(table, hi);
-    uint8x16_t result = vorrq_u8(vshlq_n_u8(rlo, 4), rhi);
-    return vreinterpretq_u64_u8(result);
+/* ==================================================================
+ * Reflected-domain GHASH — exact translation of Go's gcm_arm64.s.
+ *
+ * Key insight (verified by disassembly): Go's VEXT $8, A, B, D
+ * compiles to EXT D, B, A, #8, i.e. D = B[8:15] || A[0:7].
+ * The SOURCE OPERANDS ARE REVERSED from ARM64 EXT convention.
+ *
+ * The reflected domain uses VREV64 (byte swap within each u64,
+ * NO half-swap) to transform data. No bit reversal needed at all.
+ * ================================================================== */
+
+/* swap64: exchange the two 64-bit lanes */
+__attribute__((target("crypto"))) static inline uint64x2_t swap64(uint64x2_t v) {
+    return vreinterpretq_u64_u8(
+        vextq_u8(vreinterpretq_u8_u64(v), vreinterpretq_u8_u64(v), 8));
 }
 
-/* Store natural order result back to GHASH big-endian bytes. */
-__attribute__((target("crypto"))) static inline void nat_store(u8* p, uint64x2_t v) {
-    /* Same optimization as nat_load: the bitrev128_neon + rev64+ext
-     * composition reduces to just within-byte bit reversal. */
-    uint64x2_t m1 = vdupq_n_u64(0x5555555555555555ULL);
-    uint64x2_t m2 = vdupq_n_u64(0x3333333333333333ULL);
-    uint64x2_t m3 = vdupq_n_u64(0x0F0F0F0F0F0F0F0FULL);
-    v = vorrq_u64(vshlq_n_u64(vandq_u64(v, m1), 1), vandq_u64(vshrq_n_u64(v, 1), m1));
-    v = vorrq_u64(vshlq_n_u64(vandq_u64(v, m2), 2), vandq_u64(vshrq_n_u64(v, 2), m2));
-    v = vorrq_u64(vshlq_n_u64(vandq_u64(v, m3), 4), vandq_u64(vshrq_n_u64(v, 4), m3));
-    vst1q_u64((uint64_t*)p, v);
+/* VREV64: byte swap within each 8-byte group (the data transform) */
+__attribute__((target("crypto"))) static inline uint64x2_t vrev64_ld(u8 const* p) {
+    return vreinterpretq_u64_u8(vrev64q_u8(vld1q_u8(p)));
 }
 
-/* 128×128 carry-less multiplication (Karatsuba, 3 PMULLs).
- * Output: 256-bit product as (lo, hi). */
+/* mulRound: accumulate one block's product into (acc0, acc1, accm).
+ * t1 = H^i (from table), t2 = H^i ⊕ swap(H^i) (Karatsuba precompute).
+ * x must already be VREV64'd and XORed with accumulator. */
 __attribute__((target("crypto"))) static inline void
-pmull_128(uint64x2_t a, uint64x2_t b, uint64x2_t* lo, uint64x2_t* hi) {
-    uint64_t a0 = vgetq_lane_u64(a, 0), a1 = vgetq_lane_u64(a, 1);
-    uint64_t b0 = vgetq_lane_u64(b, 0), b1 = vgetq_lane_u64(b, 1);
-    poly128_t pl = vmull_p64(a0, b0);
-    poly128_t ph = vmull_p64(a1, b1);
-    poly128_t pm = vmull_p64(a0 ^ a1, b0 ^ b1);
-    uint64x2_t vl = vreinterpretq_u64_p128(pl);
-    uint64x2_t vh = vreinterpretq_u64_p128(ph);
-    uint64x2_t vm = vreinterpretq_u64_p128(pm);
-    vm = veorq_u64(vm, vl);
-    vm = veorq_u64(vm, vh);
-    uint64_t d0 = vgetq_lane_u64(vl, 0);
-    uint64_t d1 = vgetq_lane_u64(vl, 1) ^ vgetq_lane_u64(vm, 0);
-    uint64_t d2 = vgetq_lane_u64(vh, 0) ^ vgetq_lane_u64(vm, 1);
-    uint64_t d3 = vgetq_lane_u64(vh, 1);
-    uint64x2_t r0 = vcombine_u64(vcreate_u64(d0), vcreate_u64(d1));
-    uint64x2_t r1 = vcombine_u64(vcreate_u64(d2), vcreate_u64(d3));
-    *lo = r0;
-    *hi = r1;
+mul_round(uint64x2_t x, uint64x2_t t1, uint64x2_t t2, uint64x2_t* acc0,
+          uint64x2_t* acc1, uint64x2_t* accm) {
+    uint64x2_t t0 = veorq_u64(x, swap64(x)); /* Karatsuba mid */
+    *acc1 = veorq_u64(
+        *acc1, vreinterpretq_u64_p128(vmull_p64((poly64_t)vgetq_lane_u64(x, 0),
+                                                (poly64_t)vgetq_lane_u64(t1, 0))));
+    *acc0 = veorq_u64(
+        *acc0, vreinterpretq_u64_p128(vmull_p64((poly64_t)vgetq_lane_u64(x, 1),
+                                                (poly64_t)vgetq_lane_u64(t1, 1))));
+    *accm = veorq_u64(
+        *accm, vreinterpretq_u64_p128(vmull_p64((poly64_t)vgetq_lane_u64(t0, 0),
+                                                (poly64_t)vgetq_lane_u64(t2, 0))));
 }
 
-/* Reduce 256-bit product to 128 bits (natural order, R = 0x87). */
-__attribute__((target("crypto"))) static inline uint64x2_t pmull_reduce(uint64x2_t lo,
-                                                                        uint64x2_t hi) {
-    uint64_t d0 = vgetq_lane_u64(lo, 0), d1 = vgetq_lane_u64(lo, 1);
-    uint64_t d2 = vgetq_lane_u64(hi, 0), d3 = vgetq_lane_u64(hi, 1);
-    { /* fold d3 */
-        poly128_t t = vmull_p64(d3, 0x87);
-        uint64x2_t vt = vreinterpretq_u64_p128(t);
-        d1 ^= vgetq_lane_u64(vt, 0);
-        d2 ^= vgetq_lane_u64(vt, 1);
+/* reduce: fold the 256-bit accumulator to 128 bits.
+ * Result in acc0. Follows Go's reduce() macro exactly. */
+__attribute__((target("crypto"))) static inline void
+reduce_go(uint64x2_t* acc0_p, uint64x2_t* acc1_p, uint64x2_t accm) {
+    uint64x2_t poly = {0xC200000000000000ULL, 1};
+    uint64x2_t zero = vdupq_n_u64(0);
+    uint64x2_t acc0 = *acc0_p, acc1 = *acc1_p;
+
+    accm = veorq_u64(veorq_u64(accm, acc0), acc1);
+
+    /* VEXT $8, ZERO, ACCM, T0 → T0 = ACCM[8:] || ZERO[:8] = {ACCM_hi, 0} */
+    uint64x2_t t0 = vreinterpretq_u64_u8(
+        vextq_u8(vreinterpretq_u8_u64(accm), vreinterpretq_u8_u64(zero), 8));
+    /* VEXT $8, ACCM, ZERO, ACCM → ACCM = ZERO[8:] || ACCM[:8] = {0, ACCM_lo} */
+    accm = vreinterpretq_u64_u8(
+        vextq_u8(vreinterpretq_u8_u64(zero), vreinterpretq_u8_u64(accm), 8));
+
+    acc0 = veorq_u64(acc0, accm); /* ACC0 ^= {0, ACCM_lo} */
+    acc1 = veorq_u64(acc1, t0);   /* ACC1 ^= {ACCM_hi, 0} */
+
+    t0 = vreinterpretq_u64_p128(vmull_p64((poly64_t)vgetq_lane_u64(poly, 0),
+                                          (poly64_t)vgetq_lane_u64(acc0, 0)));
+    acc0 = veorq_u64(swap64(acc0), t0);
+
+    t0 = vreinterpretq_u64_p128(vmull_p64((poly64_t)vgetq_lane_u64(poly, 0),
+                                          (poly64_t)vgetq_lane_u64(acc0, 0)));
+    acc1 = veorq_u64(acc1, t0);
+
+    acc1 = swap64(acc1); /* IN PLACE — per Go's reduce() */
+    acc0 = veorq_u64(acc0, acc1);
+
+    *acc0_p = acc0;
+    *acc1_p = acc1;
+}
+
+/* Build the reflected-domain power table.
+ * entry[7] = {2H, 2H⊕swap(2H)} (initial, NOT swapped first element)
+ * entry[6..0] = {swap(P), P⊕swap(P)} (P = next power via P×2H) */
+__attribute__((target("crypto"))) static void ghash_init_refl(CvmcryptGcm* g) {
+    uint64x2_t poly = {0xC200000000000000ULL, 1};
+    uint64x2_t zero = vdupq_n_u64(0);
+
+    /* H_reflected = VREV64(H_be) */
+    uint64x2_t B0 = vrev64_ld(g->H);
+
+    /* Multiply by 2 mod P (reflected domain) — Go's exact sequence */
+    {
+        int64_t low = (int64_t)vgetq_lane_u64(B0, 0);
+        int64_t sign = low >> 63;
+        uint64x2_t T1 = vdupq_n_u64((uint64_t)sign);
+        T1 = vandq_u64(poly, T1);
+        uint64x2_t T2 = vshrq_n_u64(B0, 63);
+        /* VEXT $8, ZERO, T2, T2 → T2 = T2[8:]||ZERO[:8] = {T2_hi, 0} */
+        T2 = vreinterpretq_u64_u8(
+            vextq_u8(vreinterpretq_u8_u64(T2), vreinterpretq_u8_u64(zero), 8));
+        B0 = vshlq_n_u64(B0, 1);
+        B0 = veorq_u64(veorq_u64(B0, T1), T2);
     }
-    { /* fold d2 */
-        poly128_t t = vmull_p64(d2, 0x87);
-        uint64x2_t vt = vreinterpretq_u64_p128(t);
-        d0 ^= vgetq_lane_u64(vt, 0);
-        d1 ^= vgetq_lane_u64(vt, 1);
+    uint64x2_t B1 = veorq_u64(B0, swap64(B0));
+
+    /* Store entry 7 = {2H, 2H⊕swap(2H)} */
+    vst1q_u64((uint64_t*)g->H_refl[7], B0);
+    vst1q_u64((uint64_t*)(g->H_refl[7] + 16), B1);
+
+    /* Loop: compute entries 6 down to 0 */
+    uint64x2_t B2 = B0, B3 = B1;
+    for (int entry = 6; entry >= 0; entry--) {
+        /* new_power = B2 × B0 (Karatsuba via B3 × B1) */
+        uint64x2_t t1 = vreinterpretq_u64_p128(vmull_p64(
+            (poly64_t)vgetq_lane_u64(B2, 0), (poly64_t)vgetq_lane_u64(B0, 0)));
+        uint64x2_t t0 = vreinterpretq_u64_p128(vmull_p64(
+            (poly64_t)vgetq_lane_u64(B2, 1), (poly64_t)vgetq_lane_u64(B0, 1)));
+        uint64x2_t t2 = vreinterpretq_u64_p128(vmull_p64(
+            (poly64_t)vgetq_lane_u64(B3, 0), (poly64_t)vgetq_lane_u64(B1, 0)));
+
+        /* Fold + reduce (initLoop variant: EXTRA swap round) */
+        t2 = veorq_u64(veorq_u64(t2, t0), t1);
+        uint64x2_t t3 = vreinterpretq_u64_u8(
+            vextq_u8(vreinterpretq_u8_u64(t2), vreinterpretq_u8_u64(zero), 8));
+        t2 = vreinterpretq_u64_u8(
+            vextq_u8(vreinterpretq_u8_u64(zero), vreinterpretq_u8_u64(t2), 8));
+        t0 = veorq_u64(t0, t2);
+        t1 = veorq_u64(t1, t3);
+
+        t2 = vreinterpretq_u64_p128(vmull_p64((poly64_t)vgetq_lane_u64(poly, 0),
+                                              (poly64_t)vgetq_lane_u64(t0, 0)));
+        t0 = veorq_u64(swap64(t0), t2);
+
+        t2 = vreinterpretq_u64_p128(vmull_p64((poly64_t)vgetq_lane_u64(poly, 0),
+                                              (poly64_t)vgetq_lane_u64(t0, 0)));
+        t0 = veorq_u64(swap64(t0), t2); /* EXTRA swap round (initLoop) */
+
+        B2 = veorq_u64(t1, t0); /* new power = T1 ⊕ T0 */
+
+        /* Karatsuba precompute: B3 = P ⊕ swap(P), B2 = swap(P) */
+        B3 = B2;
+        B2 = swap64(B2);
+        B3 = veorq_u64(B3, B2);
+
+        vst1q_u64((uint64_t*)g->H_refl[entry], B2);
+        vst1q_u64((uint64_t*)(g->H_refl[entry] + 16), B3);
     }
-    return vcombine_u64(vcreate_u64(d0), vcreate_u64(d1));
 }
 
-/* Single gf128 multiply (for compatibility + H power computation). */
-__attribute__((target("crypto"))) void gf128_mul_pmull(u8 const* a, u8 const* b,
-                                                       u8* out) {
-    uint64x2_t av = nat_load(a);
-    uint64x2_t bv = nat_load(b);
-    uint64x2_t lo, hi;
-    pmull_128(av, bv, &lo, &hi);
-    uint64x2_t result = pmull_reduce(lo, hi);
-    nat_store(out, result);
+/* 8-block aggregated reflected-domain GHASH.
+ * 24 PMULLs + 1 reduction per 128 bytes. Zero bit reversal. */
+__attribute__((target("crypto"))) static void ghash_8blocks_refl(CvmcryptGcm* g,
+                                                                 u8 const* data) {
+    uint64x2_t acc0 = vdupq_n_u64(0), acc1 = vdupq_n_u64(0), accm = vdupq_n_u64(0);
+
+    /* First block: XOR with running accumulator */
+    uint64x2_t acc_prev = vld1q_u64((uint64_t const*)g->X_refl);
+    uint64x2_t x0 = veorq_u64(vrev64_ld(data), acc_prev);
+
+    /* Table: entry[0] = highest power (block 1), entry[7] = 2H (block 8). */
+    uint64x2_t t1 = vld1q_u64((uint64_t const*)g->H_refl[0]);
+    uint64x2_t t2 = vld1q_u64((uint64_t const*)(g->H_refl[0] + 16));
+    {
+        uint64x2_t t0 = veorq_u64(x0, swap64(x0));
+        acc1 = vreinterpretq_u64_p128(vmull_p64((poly64_t)vgetq_lane_u64(x0, 0),
+                                                (poly64_t)vgetq_lane_u64(t1, 0)));
+        acc0 = vreinterpretq_u64_p128(vmull_p64((poly64_t)vgetq_lane_u64(x0, 1),
+                                                (poly64_t)vgetq_lane_u64(t1, 1)));
+        accm = vreinterpretq_u64_p128(vmull_p64((poly64_t)vgetq_lane_u64(t0, 0),
+                                                (poly64_t)vgetq_lane_u64(t2, 0)));
+    }
+
+    /* Blocks 2-8: entries 1-7 (decreasing power) */
+    for (int i = 1; i <= 7; i++) {
+        t1 = vld1q_u64((uint64_t const*)g->H_refl[i]);
+        t2 = vld1q_u64((uint64_t const*)(g->H_refl[i] + 16));
+        mul_round(vrev64_ld(data + i * 16), t1, t2, &acc0, &acc1, &accm);
+    }
+
+    reduce_go(&acc0, &acc1, accm);
+    vst1q_u64((uint64_t*)g->X_refl, acc0);
 }
 
-#if defined(__aarch64__)
-/* 4-block aggregated GHASH (the hot path).
- * Precomputed H^1..H^4 allow processing 4 blocks with 12 PMULLs
- * and a single reduction (vs 20 PMULLs for sequential). */
-__attribute__((target("crypto"))) static void ghash_4blocks(CvmcryptGcm* g,
-                                                            u8 const* data) {
-    uint64x2_t h1 = vld1q_u64((uint64_t const*)g->H_nat[0]);
-    uint64x2_t h2 = vld1q_u64((uint64_t const*)g->H_nat[1]);
-    uint64x2_t h3 = vld1q_u64((uint64_t const*)g->H_nat[2]);
-    uint64x2_t h4 = vld1q_u64((uint64_t const*)g->H_nat[3]);
-    uint64x2_t x1 = nat_load(data);
-    uint64x2_t x2 = nat_load(data + 16);
-    uint64x2_t x3 = nat_load(data + 32);
-    uint64x2_t x4 = nat_load(data + 48);
-    uint64x2_t acc = vld1q_u64((uint64_t const*)g->X_nat);
-    acc = veorq_u64(acc, x1);
-
-    uint64x2_t lo1, hi1, lo2, hi2, lo3, hi3, lo4, hi4;
-    pmull_128(acc, h4, &lo1, &hi1); /* (Y⊕X1)·H^4 */
-    pmull_128(x2, h3, &lo2, &hi2);  /* X2·H^3 */
-    pmull_128(x3, h2, &lo3, &hi3);  /* X3·H^2 */
-    pmull_128(x4, h1, &lo4, &hi4);  /* X4·H^1 */
-
-    uint64x2_t lo_s = veorq_u64(veorq_u64(lo1, lo2), veorq_u64(lo3, lo4));
-    uint64x2_t hi_s = veorq_u64(veorq_u64(hi1, hi2), veorq_u64(hi3, hi4));
-
-    uint64x2_t result = pmull_reduce(lo_s, hi_s);
-    vst1q_u64((uint64_t*)g->X_nat, result);
-}
-#endif
 #endif
 
-/* Dispatch: use PMULL on aarch64, scalar elsewhere. */
+/* Single-block GHASH multiply (slow path for partial blocks).
+ * On aarch64, uses the reflected-domain single-block path;
+ * elsewhere, scalar bit-by-bit. */
 static void gf128_mul(u8 const* a, u8 const* b, u8* out, u8 impl) {
-#if defined(__aarch64__)
-    if (impl == CVMCRYPT_GCM_IMPL_PMULL) {
-        gf128_mul_pmull(a, b, out);
-        return;
-    }
-#endif
     gf128_mul_scalar(a, b, out);
+    (void)impl;
 }
 
 /* ------------------------------------------------------------------ */
@@ -204,19 +258,19 @@ static void ghash_update(CvmcryptGcm* g, u8 const* data, usize len, u64* total_b
     *total_bits += len * 8;
 
 #if defined(__aarch64__)
-    /* Fast path: 4-block aggregated GHASH with precomputed H powers. */
-    if (g->impl == CVMCRYPT_GCM_IMPL_PMULL && g->buflen == 0 && len >= 64) {
-        /* Sync X_nat from g->X before fast path (in case slow path ran first). */
-        uint64x2_t xn = nat_load(g->X);
-        vst1q_u64((uint64_t*)g->X_nat, xn);
-        usize num4 = len / 64;
-        for (usize i = 0; i < num4; i++) {
-            ghash_4blocks(g, data);
-            data += 64;
-            len -= 64;
+    /* Fast path: 8-block reflected-domain GHASH (zero bit reversal). */
+    if (g->impl == CVMCRYPT_GCM_IMPL_PMULL && g->buflen == 0 && len >= 128) {
+        /* Enter fast path: sync X_refl from g->X (in case slow path ran). */
+        vst1q_u64((uint64_t*)g->X_refl, vrev64_ld(g->X));
+        usize num8 = len / 128;
+        for (usize i = 0; i < num8; i++) {
+            ghash_8blocks_refl(g, data);
+            data += 128;
+            len -= 128;
         }
-        /* Always sync g->X from X_nat after fast path. */
-        nat_store(g->X, vld1q_u64((uint64_t const*)g->X_nat));
+        /* Exit fast path: sync g->X from X_refl. */
+        vst1q_u8(g->X, vrev64q_u8(vreinterpretq_u8_u64(
+                           vld1q_u64((uint64_t const*)g->X_refl))));
     }
 #endif
 
@@ -235,11 +289,10 @@ static void ghash_update(CvmcryptGcm* g, u8 const* data, usize len, u64* total_b
                 g->X[i] ^= g->buf[i];
             }
             gf128_mul(g->X, g->H, g->X, g->impl);
-            /* Sync natural-order accumulator. */
+            /* Sync reflected accumulator for the fast path. */
 #if defined(__aarch64__)
             if (g->impl == CVMCRYPT_GCM_IMPL_PMULL) {
-                uint64x2_t xn = nat_load(g->X);
-                vst1q_u64((uint64_t*)g->X_nat, xn);
+                vst1q_u64((uint64_t*)g->X_refl, vrev64_ld(g->X));
             }
 #endif
             g->buflen = 0;
@@ -255,6 +308,11 @@ static void ghash_flush(CvmcryptGcm* g, u64 aad_bits, u64 pt_bits) {
             g->X[i] ^= g->buf[i];
         }
         gf128_mul(g->X, g->H, g->X, g->impl);
+#if defined(__aarch64__)
+        if (g->impl == CVMCRYPT_GCM_IMPL_PMULL) {
+            vst1q_u64((uint64_t*)g->X_refl, vrev64_ld(g->X));
+        }
+#endif
         g->buflen = 0;
     }
 
@@ -268,6 +326,11 @@ static void ghash_flush(CvmcryptGcm* g, u64 aad_bits, u64 pt_bits) {
         g->X[i] ^= lenblk[i];
     }
     gf128_mul(g->X, g->H, g->X, g->impl);
+#if defined(__aarch64__)
+    if (g->impl == CVMCRYPT_GCM_IMPL_PMULL) {
+        vst1q_u64((uint64_t*)g->X_refl, vrev64_ld(g->X));
+    }
+#endif
 }
 
 /* ------------------------------------------------------------------ */
@@ -290,7 +353,7 @@ static bool gcm_setup(CvmcryptGcm* g, u8 const* key, usize keylen, u8 const iv[1
 
     /* Reset the accumulator. */
     memset(g->X, 0, 16);
-    memset(g->X_nat, 0, 16);
+    memset(g->X_refl, 0, 16);
     g->buflen = 0;
     g->aadlen = 0;
     g->ptlen = 0;
@@ -302,20 +365,9 @@ static bool gcm_setup(CvmcryptGcm* g, u8 const* key, usize keylen, u8 const iv[1
 #endif
 
 #if defined(__aarch64__)
-    /* Precompute H^1..H^4 in natural polynomial order for 4-block GHASH. */
+    /* Build reflected-domain power table for 8-block GHASH. */
     if (g->impl == CVMCRYPT_GCM_IMPL_PMULL) {
-        u8 hp2[16], hp3[16], hp4[16];
-        gf128_mul_pmull(g->H, g->H, hp2); /* hp2 = H^2 */
-        gf128_mul_pmull(hp2, g->H, hp3);  /* hp3 = H^3 */
-        gf128_mul_pmull(hp2, hp2, hp4);   /* hp4 = H^4 */
-        uint64x2_t h1v = nat_load(g->H);
-        uint64x2_t h2v = nat_load(hp2);
-        uint64x2_t h3v = nat_load(hp3);
-        uint64x2_t h4v = nat_load(hp4);
-        vst1q_u64((uint64_t*)g->H_nat[0], h1v);
-        vst1q_u64((uint64_t*)g->H_nat[1], h2v);
-        vst1q_u64((uint64_t*)g->H_nat[2], h3v);
-        vst1q_u64((uint64_t*)g->H_nat[3], h4v);
+        ghash_init_refl(g);
     }
 #endif
 
@@ -427,6 +479,11 @@ bool cvmcrypt_gcm_encrypt(CvmcryptGcm* g, u8 const* key, usize keylen, u8 const 
             g->X[i] ^= g->buf[i];
         }
         gf128_mul(g->X, g->H, g->X, g->impl);
+#if defined(__aarch64__)
+        if (g->impl == CVMCRYPT_GCM_IMPL_PMULL) {
+            vst1q_u64((uint64_t*)g->X_refl, vrev64_ld(g->X));
+        }
+#endif
         g->buflen = 0;
     }
 
@@ -480,6 +537,11 @@ bool cvmcrypt_gcm_decrypt(CvmcryptGcm* g, u8 const* key, usize keylen, u8 const 
             g->X[i] ^= g->buf[i];
         }
         gf128_mul(g->X, g->H, g->X, g->impl);
+#if defined(__aarch64__)
+        if (g->impl == CVMCRYPT_GCM_IMPL_PMULL) {
+            vst1q_u64((uint64_t*)g->X_refl, vrev64_ld(g->X));
+        }
+#endif
         g->buflen = 0;
     }
 
