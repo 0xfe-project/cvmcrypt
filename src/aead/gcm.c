@@ -73,19 +73,37 @@ bitrev128_neon(uint64x2_t v) {
 
 /* Load a GHASH block (big-endian bytes) and convert to natural PMULL order. */
 __attribute__((target("crypto"))) static inline uint64x2_t nat_load(u8 const* p) {
-    uint8x16_t v = vld1q_u8(p);
-    v = vrev64q_u8(v);
-    v = vextq_u8(v, v, 8);
-    return bitrev128_neon(vreinterpretq_u64_u8(v));
+    /* Optimization: the old version did rev64+ext, then bitrev128_neon
+     * (which also does rev64+ext). The two rev64+ext cancel out (they
+     * commute with within-byte bit reversal and are self-inverse).
+     * Net effect was ONLY within-byte bit reversal. So just do that
+     * directly — 4 fewer instructions per block.
+     *
+     * Correctness: GHASH big-endian bytes load as LE u64 pairs.
+     * Byte 0 (first) has x^0..x^7 (MSB→LSB). LE u64 puts byte 0 in
+     * the low byte, so bit 0..7 of u64 = byte 0 = x^0..x^7. We only
+     * need to reverse bits within each byte to put x^0 at u64 bit 0. */
+    uint64x2_t v = vld1q_u64((uint64_t const*)p);
+    uint64x2_t m1 = vdupq_n_u64(0x5555555555555555ULL);
+    uint64x2_t m2 = vdupq_n_u64(0x3333333333333333ULL);
+    uint64x2_t m3 = vdupq_n_u64(0x0F0F0F0F0F0F0F0FULL);
+    v = vorrq_u64(vshlq_n_u64(vandq_u64(v, m1), 1), vandq_u64(vshrq_n_u64(v, 1), m1));
+    v = vorrq_u64(vshlq_n_u64(vandq_u64(v, m2), 2), vandq_u64(vshrq_n_u64(v, 2), m2));
+    v = vorrq_u64(vshlq_n_u64(vandq_u64(v, m3), 4), vandq_u64(vshrq_n_u64(v, 4), m3));
+    return v;
 }
 
 /* Store natural order result back to GHASH big-endian bytes. */
 __attribute__((target("crypto"))) static inline void nat_store(u8* p, uint64x2_t v) {
-    uint64x2_t rv = bitrev128_neon(v);
-    uint8x16_t vb = vreinterpretq_u8_u64(rv);
-    vb = vextq_u8(vb, vb, 8);
-    vb = vrev64q_u8(vb);
-    vst1q_u8(p, vb);
+    /* Same optimization as nat_load: the bitrev128_neon + rev64+ext
+     * composition reduces to just within-byte bit reversal. */
+    uint64x2_t m1 = vdupq_n_u64(0x5555555555555555ULL);
+    uint64x2_t m2 = vdupq_n_u64(0x3333333333333333ULL);
+    uint64x2_t m3 = vdupq_n_u64(0x0F0F0F0F0F0F0F0FULL);
+    v = vorrq_u64(vshlq_n_u64(vandq_u64(v, m1), 1), vandq_u64(vshrq_n_u64(v, 1), m1));
+    v = vorrq_u64(vshlq_n_u64(vandq_u64(v, m2), 2), vandq_u64(vshrq_n_u64(v, 2), m2));
+    v = vorrq_u64(vshlq_n_u64(vandq_u64(v, m3), 4), vandq_u64(vshrq_n_u64(v, 4), m3));
+    vst1q_u64((uint64_t*)p, v);
 }
 
 /* 128×128 carry-less multiplication (Karatsuba, 3 PMULLs).
