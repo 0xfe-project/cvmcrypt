@@ -9,7 +9,7 @@
 | Metric | cvmcrypt | Go | Rust ring | vs Go | vs ring |
 |--------|--------:|---:|----------:|------:|--------:|
 | X25519 | **20.4 µs** | **23.5** | **7.0** | **beats ✅** | 2.9× gap |
-| AES-128-GCM | **~4,200 MB/s** | **10,185** | **9,352** | 2.4× gap | 2.2× gap |
+| AES-128-GCM | **~7,100 MB/s** | **10,185** | **9,352** | 1.43× gap | 1.32× gap |
 | SHA-256 | **~3,272 MB/s** | **3,434** | **3,419** | ~parity | ~parity |
 | TLS handshake | **40.7 µs** | — | — | complete ✅ | complete ✅ |
 
@@ -25,6 +25,9 @@
 | 4 | + 8-block aggregated GHASH | 3,900 MB/s |
 | 5 | + batched AES-CTR (4 blocks parallel) | 5,402 MB/s (cold) |
 | 6 | + vqtbl1q lookup bit-reversal (15→6 instr) | ~4,200 MB/s (sustained) |
+| 7 | + reflected-domain GHASH (Go gcm_arm64.s translation) | ~5,800 MB/s |
+| 8 | + fused AES-CTR+GHASH 128-byte loop | ~6,900 MB/s |
+| 9 | + hoisted round keys + pure NEON counters | ~7,100 MB/s |
 
 Component analysis:
 ```
