@@ -53,24 +53,6 @@ void gf128_mul_scalar(u8 const* a, u8 const* b, u8* out) {
 #if defined(__aarch64__)
 #include <arm_neon.h>
 
-/* NEON-native 128-bit bit reversal (no NEON↔ARM transfers).
- * Converts GHASH reflected order to PMULL natural order. */
-__attribute__((target("crypto"))) static inline uint64x2_t
-bitrev128_neon(uint64x2_t v) {
-    uint64x2_t m1 = vdupq_n_u64(0x5555555555555555ULL);
-    uint64x2_t m2 = vdupq_n_u64(0x3333333333333333ULL);
-    uint64x2_t m3 = vdupq_n_u64(0x0F0F0F0F0F0F0F0FULL);
-    /* Reverse bits within each byte (3 shift-mask rounds). */
-    v = vorrq_u64(vshlq_n_u64(vandq_u64(v, m1), 1), vandq_u64(vshrq_n_u64(v, 1), m1));
-    v = vorrq_u64(vshlq_n_u64(vandq_u64(v, m2), 2), vandq_u64(vshrq_n_u64(v, 2), m2));
-    v = vorrq_u64(vshlq_n_u64(vandq_u64(v, m3), 4), vandq_u64(vshrq_n_u64(v, 4), m3));
-    /* Reverse bytes + swap halves = full 128-bit reversal. */
-    uint8x16_t vb = vreinterpretq_u8_u64(v);
-    vb = vrev64q_u8(vb);
-    vb = vextq_u8(vb, vb, 8);
-    return vreinterpretq_u64_u8(vb);
-}
-
 /* Load a GHASH block (big-endian bytes) and convert to natural PMULL order. */
 __attribute__((target("crypto"))) static inline uint64x2_t nat_load(u8 const* p) {
     /* Optimization: the old version did rev64+ext, then bitrev128_neon
