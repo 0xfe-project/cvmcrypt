@@ -28,6 +28,9 @@
 | 7 | + reflected-domain GHASH (Go gcm_arm64.s translation) | ~5,800 MB/s |
 | 8 | + fused AES-CTR+GHASH 128-byte loop | ~6,900 MB/s |
 | 9 | + hoisted round keys + pure NEON counters | ~7,100 MB/s |
+| 10 | + s[] reuse + acc register (production) | ~7,200 MB/s |
+| 11 | .S sequential 8-block (experiment) | ~6,200 MB/s |
+| 12 | .S ring-style pipeline (experiment) | ~5,365 MB/s |
 
 Component analysis:
 ```
@@ -63,12 +66,22 @@ Full interop verified with example.com:
 
 ## Remaining Gap Analysis
 
-### AES-GCM (2.4× from Go)
-Go uses **reflected-domain GHASH** — zero bit reversal per block.
-Our attempts (5+) to replicate the reflected domain failed:
-VREV64+EXT is not a ring homomorphism; Go's compensation mechanism
-(pre-multiplied H, POLY={0xC2..,0x01}) requires exact instruction-level
-translation from their .s file.
+### AES-GCM (1.42× from Go, 1.30× from ring)
+We implemented the reflected-domain GHASH (exact Go translation) and
+the fused AES+GHASH 128-byte loop. C intrinsics at ~7,200 MB/s.
+
+Hand-written assembly experiments (.S) yielded LOWER performance:
+- Sequential 8-block: 6,200 MB/s
+- ring-style pipeline (AES next ∥ GHASH prev): 5,365 MB/s
+
+The clang -O3 scheduler on Apple M5 produces better instruction
+ordering than manual scheduling. ring (9,352) and Go (10,185) use
+hand-tuned assembly profiled against specific ARM cores; without the
+same profiling infrastructure, manual scheduling is counterproductive.
+
+Remaining gap analysis:
+- 7,200 vs 9,352 (ring): 30% — instruction scheduling quality
+- 7,200 vs 10,185 (Go): 42% — same + deeper pipelining
 
 ### X25519 (2.9× from ring)
 ring uses NEON with 10×25.5-bit limbs (~35 instructions per field multiply
