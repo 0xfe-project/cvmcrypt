@@ -601,7 +601,7 @@ bool cvmcrypt_gcm_encrypt(CvmcryptGcm* g, u8 const* key, usize keylen, u8 const 
         /* Sync X → X_refl for the fused loop. */
         vst1q_u64((uint64_t*)g->X_refl, vrev64_ld(g->X));
         usize n128 = ptlen & ~(usize)127;
-        gcm_crypt_hash_asm64(g, pt, ct, n128);
+        gcm_crypt_hash_loop(g, pt, ct, n128);
         g->ptlen += n128 * 8;
         /* Sync X_refl → X for the slow path and ghash_flush. */
         vst1q_u8(g->X, vrev64q_u8(vreinterpretq_u8_u64(
