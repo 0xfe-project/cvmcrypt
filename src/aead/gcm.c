@@ -442,6 +442,9 @@ gcm_crypt_hash_loop(CvmcryptGcm* g, u8 const* in, u8* out, usize nbytes) {
         rk[r] = vrev32q_u8(vld1q_u8((u8 const*)&g->aes.enc[4 * r]));
     }
 
+    /* Running GHASH accumulator — stays in a register across iterations. */
+    uint64x2_t acc_run = vld1q_u64((uint64_t const*)g->X_refl);
+
     while (nbytes >= 128) {
         nbytes -= 128;
 
@@ -470,23 +473,23 @@ gcm_crypt_hash_loop(CvmcryptGcm* g, u8 const* in, u8* out, usize nbytes) {
         for (int i = 0; i < 8; i++)
             s[i] = veorq_u8(vaeseq_u8(s[i], rk[9]), rk[10]);
 
-        /* XOR with input, store ciphertext, convert to reflected domain. */
-        uint64x2_t xb[8];
+        /* XOR with input, store ciphertext, convert to reflected domain.
+         * REUSE s[] as xb[] — saves 8 NEON registers (no spill). */
         for (int i = 0; i < 8; i++) {
             uint8x16_t p = vld1q_u8(in + i * 16);
-            uint8x16_t ct = veorq_u8(p, s[i]);
-            vst1q_u8(out + i * 16, ct);
-            xb[i] = vreinterpretq_u64_u8(vrev64q_u8(ct));
+            s[i] = veorq_u8(p, s[i]);
+            vst1q_u8(out + i * 16, s[i]);
+            s[i] = vrev64q_u8(s[i]); /* now holds reflected ciphertext */
         }
 
-        /* GHASH 8 blocks (reflected domain) — same as ghash_8blocks_refl. */
+        /* GHASH 8 blocks (reflected domain).
+         * Accumulator stays in a register across iterations. */
         uint64x2_t acc0 = vdupq_n_u64(0), acc1 = vdupq_n_u64(0), accm = vdupq_n_u64(0);
-        uint64x2_t acc_prev = vld1q_u64((uint64_t const*)g->X_refl);
-        uint64x2_t x0 = veorq_u64(xb[0], acc_prev);
-
-        uint64x2_t t1 = vld1q_u64((uint64_t const*)g->H_refl[0]);
-        uint64x2_t t2 = vld1q_u64((uint64_t const*)(g->H_refl[0] + 16));
         {
+            uint64x2_t x0 = veorq_u64(vreinterpretq_u64_u8(s[0]), acc_run);
+
+            uint64x2_t t1 = vld1q_u64((uint64_t const*)g->H_refl[0]);
+            uint64x2_t t2 = vld1q_u64((uint64_t const*)(g->H_refl[0] + 16));
             uint64x2_t t0 = veorq_u64(x0, swap64(x0));
             acc1 = vreinterpretq_u64_p128(vmull_p64((poly64_t)vgetq_lane_u64(x0, 0),
                                                     (poly64_t)vgetq_lane_u64(t1, 0)));
@@ -497,17 +500,18 @@ gcm_crypt_hash_loop(CvmcryptGcm* g, u8 const* in, u8* out, usize nbytes) {
         }
 
         for (int i = 1; i <= 7; i++) {
-            t1 = vld1q_u64((uint64_t const*)g->H_refl[i]);
-            t2 = vld1q_u64((uint64_t const*)(g->H_refl[i] + 16));
-            mul_round(xb[i], t1, t2, &acc0, &acc1, &accm);
+            uint64x2_t t1 = vld1q_u64((uint64_t const*)g->H_refl[i]);
+            uint64x2_t t2 = vld1q_u64((uint64_t const*)(g->H_refl[i] + 16));
+            mul_round(vreinterpretq_u64_u8(s[i]), t1, t2, &acc0, &acc1, &accm);
         }
 
         reduce_go(&acc0, &acc1, accm);
-        vst1q_u64((uint64_t*)g->X_refl, acc0);
+        acc_run = acc0; /* keep in register for next iteration */
 
         in += 128;
         out += 128;
     } /* while */
+    vst1q_u64((uint64_t*)g->X_refl, acc_run); /* store once after loop */
 }
 #endif
 
