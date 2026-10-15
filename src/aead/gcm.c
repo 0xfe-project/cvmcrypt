@@ -55,24 +55,25 @@ void gf128_mul_scalar(u8 const* a, u8 const* b, u8* out) {
 
 /* Load a GHASH block (big-endian bytes) and convert to natural PMULL order. */
 __attribute__((target("crypto"))) static inline uint64x2_t nat_load(u8 const* p) {
-    /* Optimization: the old version did rev64+ext, then bitrev128_neon
-     * (which also does rev64+ext). The two rev64+ext cancel out (they
-     * commute with within-byte bit reversal and are self-inverse).
-     * Net effect was ONLY within-byte bit reversal. So just do that
-     * directly — 4 fewer instructions per block.
+    /* Within-byte bit reversal via 4-bit lookup table (vqtbl1q).
+     * 6 instructions vs 15 for 3-round shift-mask.
      *
-     * Correctness: GHASH big-endian bytes load as LE u64 pairs.
-     * Byte 0 (first) has x^0..x^7 (MSB→LSB). LE u64 puts byte 0 in
-     * the low byte, so bit 0..7 of u64 = byte 0 = x^0..x^7. We only
-     * need to reverse bits within each byte to put x^0 at u64 bit 0. */
-    uint64x2_t v = vld1q_u64((uint64_t const*)p);
-    uint64x2_t m1 = vdupq_n_u64(0x5555555555555555ULL);
-    uint64x2_t m2 = vdupq_n_u64(0x3333333333333333ULL);
-    uint64x2_t m3 = vdupq_n_u64(0x0F0F0F0F0F0F0F0FULL);
-    v = vorrq_u64(vshlq_n_u64(vandq_u64(v, m1), 1), vandq_u64(vshrq_n_u64(v, 1), m1));
-    v = vorrq_u64(vshlq_n_u64(vandq_u64(v, m2), 2), vandq_u64(vshrq_n_u64(v, 2), m2));
-    v = vorrq_u64(vshlq_n_u64(vandq_u64(v, m3), 4), vandq_u64(vshrq_n_u64(v, 4), m3));
-    return v;
+     * Correctness: GHASH BE bytes loaded as LE u64 pairs.
+     * Byte 0 has x^0..x^7 (MSB→LSB). LE puts byte 0 in low byte.
+     * Only need bit reversal within each byte (x^0 → bit 0).
+     *
+     * Table: rev4[n] = bit-reverse of 4-bit n.
+     * byte b = hi*16+lo → reversed = (rev4[lo]<<4) | rev4[hi]. */
+    static const uint8_t rev4_tab[16] = {0, 8, 4, 12, 2, 10, 6, 14,
+                                         1, 9, 5, 13, 3, 11, 7, 15};
+    uint8x16_t table = vld1q_u8(rev4_tab);
+    uint8x16_t v = vld1q_u8(p);
+    uint8x16_t lo = vandq_u8(v, vdupq_n_u8(0x0F));
+    uint8x16_t hi = vshrq_n_u8(v, 4);
+    uint8x16_t rlo = vqtbl1q_u8(table, lo);
+    uint8x16_t rhi = vqtbl1q_u8(table, hi);
+    uint8x16_t result = vorrq_u8(vshlq_n_u8(rlo, 4), rhi);
+    return vreinterpretq_u64_u8(result);
 }
 
 /* Store natural order result back to GHASH big-endian bytes. */
