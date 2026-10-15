@@ -434,7 +434,20 @@ __attribute__((target("crypto"))) static void gcm_crypt_4(CvmcryptGcm* g, u8 con
  * For each 128-byte chunk: AES-encrypt 8 counters, XOR with input,
  * then immediately GHASH the 8 ciphertext blocks. Data stays in
  * registers/L1 — no second pass over the ciphertext. */
-__attribute__((target("crypto"))) static void
+#if defined(__aarch64__)
+/* Pure-assembly fused AES-GCM kernel (gcm_arm64.S).
+ * Processes 64 bytes per iteration, all state in NEON registers. */
+extern void cvmcrypt_gcm_enc_kernel(u32 const* rk, u8 const* in, u8* out, usize nbytes,
+                                    u8 const* tbl_e4, u8 const* ctr, u8* xrefl);
+
+__attribute__((target("crypto"), unused)) static void
+gcm_crypt_hash_asm64(CvmcryptGcm* g, u8 const* in, u8* out, usize nbytes) {
+    cvmcrypt_gcm_enc_kernel(g->aes.enc, in, out, nbytes, &g->H_refl[0][0], g->counter,
+                            g->X_refl);
+}
+#endif
+
+__attribute__((target("crypto"), unused)) static void
 gcm_crypt_hash_loop(CvmcryptGcm* g, u8 const* in, u8* out, usize nbytes) {
     /* Load AES round keys ONCE — hoisted out of the chunk loop. */
     uint8x16_t rk[11];
@@ -588,7 +601,7 @@ bool cvmcrypt_gcm_encrypt(CvmcryptGcm* g, u8 const* key, usize keylen, u8 const 
         /* Sync X → X_refl for the fused loop. */
         vst1q_u64((uint64_t*)g->X_refl, vrev64_ld(g->X));
         usize n128 = ptlen & ~(usize)127;
-        gcm_crypt_hash_loop(g, pt, ct, n128);
+        gcm_crypt_hash_asm64(g, pt, ct, n128);
         g->ptlen += n128 * 8;
         /* Sync X_refl → X for the slow path and ghash_flush. */
         vst1q_u8(g->X, vrev64q_u8(vreinterpretq_u8_u64(
