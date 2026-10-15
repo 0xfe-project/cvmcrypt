@@ -351,7 +351,7 @@ static int cvm_x25519_exchange(CvmTlsKeyexCtx* _ctx, CvmTlsVec* secret,
     u8* shared = rt_mem_alloc(32);
     if (!shared)
         return TLS_ERROR_NO_MEMORY;
-    cvmcrypt_x25519(shared, ctx->private_key, peer_pubkey.base);
+    cvmcrypt_x25519_fast(shared, ctx->private_key, peer_pubkey.base);
     secret->base = shared;
     secret->len = 32;
     return 0;
@@ -371,7 +371,7 @@ static int cvm_x25519_create(CvmTlsKeyexCtx** _ctx) {
     ctx->private_key[31] &= 127;
     ctx->private_key[31] |= 64;
 
-    cvmcrypt_x25519_base(ctx->public_key, ctx->private_key);
+    cvmcrypt_x25519_base_fast(ctx->public_key, ctx->private_key);
 
     /* Export the public key to the generic field. */
     memcpy(ctx->super.pubkey, ctx->public_key, 32);

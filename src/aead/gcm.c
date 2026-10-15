@@ -172,49 +172,6 @@ __attribute__((target("crypto"))) static void ghash_4blocks(CvmcryptGcm* g,
     uint64x2_t result = pmull_reduce(lo_s, hi_s);
     vst1q_u64((uint64_t*)g->X_nat, result);
 }
-
-/* 8-block aggregated GHASH (matching Go's octetsLoop). */
-__attribute__((target("crypto"))) static void ghash_8blocks(CvmcryptGcm* g,
-                                                            u8 const* data) {
-    uint64x2_t h1 = vld1q_u64((uint64_t const*)g->H_nat[0]);
-    uint64x2_t h2 = vld1q_u64((uint64_t const*)g->H_nat[1]);
-    uint64x2_t h3 = vld1q_u64((uint64_t const*)g->H_nat[2]);
-    uint64x2_t h4 = vld1q_u64((uint64_t const*)g->H_nat[3]);
-    uint64x2_t h5 = vld1q_u64((uint64_t const*)g->H_nat[4]);
-    uint64x2_t h6 = vld1q_u64((uint64_t const*)g->H_nat[5]);
-    uint64x2_t h7 = vld1q_u64((uint64_t const*)g->H_nat[6]);
-    uint64x2_t h8 = vld1q_u64((uint64_t const*)g->H_nat[7]);
-    uint64x2_t x1 = nat_load(data);
-    uint64x2_t x2 = nat_load(data + 16);
-    uint64x2_t x3 = nat_load(data + 32);
-    uint64x2_t x4 = nat_load(data + 48);
-    uint64x2_t x5 = nat_load(data + 64);
-    uint64x2_t x6 = nat_load(data + 80);
-    uint64x2_t x7 = nat_load(data + 96);
-    uint64x2_t x8 = nat_load(data + 112);
-    uint64x2_t acc = vld1q_u64((uint64_t const*)g->X_nat);
-    acc = veorq_u64(acc, x1);
-
-    uint64x2_t lo1, hi1, lo2, hi2, lo3, hi3, lo4, hi4;
-    uint64x2_t lo5, hi5, lo6, hi6, lo7, hi7, lo8, hi8;
-    pmull_128(acc, h8, &lo1, &hi1); /* (Y⊕X1)·H^8 */
-    pmull_128(x2, h7, &lo2, &hi2);  /* X2·H^7 */
-    pmull_128(x3, h6, &lo3, &hi3);  /* X3·H^6 */
-    pmull_128(x4, h5, &lo4, &hi4);  /* X4·H^5 */
-    pmull_128(x5, h4, &lo5, &hi5);  /* X5·H^4 */
-    pmull_128(x6, h3, &lo6, &hi6);  /* X6·H^3 */
-    pmull_128(x7, h2, &lo7, &hi7);  /* X7·H^2 */
-    pmull_128(x8, h1, &lo8, &hi8);  /* X8·H^1 */
-
-    uint64x2_t lo_s = veorq_u64(veorq_u64(veorq_u64(lo1, lo2), veorq_u64(lo3, lo4)),
-                                veorq_u64(veorq_u64(lo5, lo6), veorq_u64(lo7, lo8)));
-    uint64x2_t hi_s = veorq_u64(veorq_u64(veorq_u64(hi1, hi2), veorq_u64(hi3, hi4)),
-                                veorq_u64(veorq_u64(hi5, hi6), veorq_u64(hi7, hi8)));
-
-    uint64x2_t result = pmull_reduce(lo_s, hi_s);
-    vst1q_u64((uint64_t*)g->X_nat, result);
-}
-
 #endif
 #endif
 
@@ -247,19 +204,6 @@ static void ghash_update(CvmcryptGcm* g, u8 const* data, usize len, u64* total_b
 
 #if defined(__aarch64__)
     /* Fast path: 4-block aggregated GHASH with precomputed H powers. */
-    if (g->impl == CVMCRYPT_GCM_IMPL_PMULL && g->buflen == 0 && len >= 128) {
-        /* Sync X_nat from g->X before fast path. */
-        uint64x2_t xn = nat_load(g->X);
-        vst1q_u64((uint64_t*)g->X_nat, xn);
-        usize num8 = len / 128;
-        for (usize i = 0; i < num8; i++) {
-            ghash_8blocks(g, data);
-            data += 128;
-            len -= 128;
-        }
-        /* Always sync g->X from X_nat after fast path. */
-        nat_store(g->X, vld1q_u64((uint64_t const*)g->X_nat));
-    }
     if (g->impl == CVMCRYPT_GCM_IMPL_PMULL && g->buflen == 0 && len >= 64) {
         /* Sync X_nat from g->X before fast path (in case slow path ran first). */
         uint64x2_t xn = nat_load(g->X);
@@ -385,7 +329,7 @@ __attribute__((target("crypto"))) static void gcm_crypt_4(CvmcryptGcm* g, u8 con
     /* Load AES round keys. */
     uint8x16_t rk[11];
     for (int r = 0; r <= 10; r++) {
-        rk[r] = vld1q_u8((u8 const*)&g->aes.enc[4 * r]);
+        rk[r] = vrev32q_u8(vld1q_u8((u8 const*)&g->aes.enc[4 * r]));
     }
 
     /* Generate 4 counters (ctr, ctr+1, ctr+2, ctr+3). */
@@ -493,10 +437,10 @@ bool cvmcrypt_gcm_encrypt(CvmcryptGcm* g, u8 const* key, usize keylen, u8 const 
      * counter as-is for the first block (no pre-increment). */
     increment_counter(g->counter);
 
-    /* Encrypt (CTR mode with 4-block batched AES). */
+    /* Encrypt. */
     gcm_crypt(g, pt, ptlen, ct);
 
-    /* Absorb the ciphertext into GHASH (4-block aggregated). */
+    /* Absorb the ciphertext into GHASH. */
     if (ct && ptlen > 0) {
         ghash_update(g, ct, ptlen, &g->ptlen);
     }

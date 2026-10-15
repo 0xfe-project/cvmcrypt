@@ -37,7 +37,6 @@ void cvmcrypt_x25519_base(u8 public_key[32], u8 const scalar[32]);
 void cvmcrypt_x25519_shared(u8 shared[32], u8 const scalar[32],
                             u8 const peer_public[32]);
 
-
 /* Fast implementation using 5x51-bit limbs (ARM64). */
 void cvmcrypt_x25519_fast(u8 out[32], u8 const scalar[32], u8 const point[32]);
 void cvmcrypt_x25519_base_fast(u8 public_key[32], u8 const scalar[32]);
