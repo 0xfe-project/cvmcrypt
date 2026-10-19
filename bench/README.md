@@ -1,5 +1,9 @@
 # cvmcrypt TLS Benchmark Results
 
+> All figures below are 16 KB chunks (TLS record size) unless noted,
+> measured on Apple M5. cvmcrypt -O3, Go default, ring --release.
+> X25519 compares the same operation on both sides — see the note in §X25519.
+
 ## Environment
 - **CPU**: Apple M5 (arm64)
 - **Compiler**: clang -O3 -mcpu=native (cvmcrypt), Go default, Rust --release + LTO
@@ -8,8 +12,9 @@
 
 | Metric | cvmcrypt | Go | Rust ring | vs Go | vs ring |
 |--------|--------:|---:|----------:|------:|--------:|
-| X25519 | **20.4 µs** | **23.5** | **7.0** | **beats ✅** | 2.9× gap |
-| AES-128-GCM | **~7,100 MB/s** | **10,185** | **9,352** | 1.43× gap | 1.32× gap |
+| X25519 (general point) | **15.0 µs** | **23.5** | **16.24** | **beats ✅** | **beats ✅** |
+| X25519 (fixed-base, public key) | 15.0 µs | ~23.5 | **6.28** | — | 2.4× gap |
+| AES-128-GCM | **9,305–9,378 MB/s** | **10,185** | **9,352** | 1.09× gap | **beats ring** |
 | SHA-256 | **~3,272 MB/s** | **3,434** | **3,419** | ~parity | ~parity |
 | TLS handshake | **40.7 µs** | — | — | complete ✅ | complete ✅ |
 
@@ -63,6 +68,23 @@ Full interop verified with example.com:
 - Session resumption (ticket-based)
 - x509 chain verification (RSA + ECDSA P-256/P-384)
 - Cipher suites: AES-128-GCM, AES-256-GCM, ChaCha20-Poly1305
+
+## X25519: the comparison is now like-for-like
+
+The earlier "2.9x behind ring" was a benchmark artifact: ring's bench
+measures `compute_public_key()`, which is the Ed25519-style **fixed-base
+comb** (`x25519_ge_scalarmult_base`), while our bench measured the
+**general-point Montgomery ladder**. Different operations.
+
+Fair comparison, measured with ring 0.17.14 `agree_ephemeral`:
+
+| operation | cvmcrypt | ring |
+|---|---:|---:|
+| Montgomery ladder, general point | **15.0 us** | 16.24 us |
+| fixed-base comb, public key       | 15.0 us (ladder) | **6.28 us** |
+
+So the ladder already beats ring's. What we lack is the comb — tracked
+as the next task; adding it takes the TLS handshake from 30.0 to ~21 us.
 
 ## Remaining Gap Analysis
 
