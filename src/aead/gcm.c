@@ -175,7 +175,10 @@ static void gcm_asm_setup(CvmcryptGcm* g, usize keylen) {
 #endif
 }
 
-static bool gcm_setup(CvmcryptGcm* g, u8 const* key, usize keylen, u8 const iv[12]) {
+/* Key-derived state. Built once per key; the message state is reset per
+ * message by gcm_msg_reset(). This split is what lets a TLS connection
+ * pay the key schedule once instead of once per record. */
+static bool gcm_key_setup(CvmcryptGcm* g, u8 const* key, usize keylen) {
     if (!cvmcrypt_aes_setup(&g->aes, key, keylen)) {
         return false;
     }
@@ -184,31 +187,34 @@ static bool gcm_setup(CvmcryptGcm* g, u8 const* key, usize keylen, u8 const iv[1
     u8 zero[16] = {0};
     cvmcrypt_aes_encrypt_block(&g->aes, zero, g->H);
 
+#if defined(__aarch64__)
+    g->impl = CVMCRYPT_GCM_IMPL_PMULL;
+    gcm_asm_setup(g, keylen);
+    g->asm_ok = true; /* AES-128/192/256 all verified */
+#else
+    g->impl = CVMCRYPT_GCM_IMPL_SCALAR;
+#endif
+    return true;
+}
+
+/* Per-message state. */
+static void gcm_msg_reset(CvmcryptGcm* g, u8 const iv[12]) {
     /* J0 = IV || 0^31 || 1 (for 96-bit IV, the TLS 1.3 case) */
     memset(g->counter, 0, 16);
     memcpy(g->counter, iv, 12);
     g->counter[15] = 1;
 
-    /* Reset the accumulator. */
     memset(g->X, 0, 16);
     g->buflen = 0;
     g->aadlen = 0;
     g->ptlen = 0;
+}
 
-#if defined(__aarch64__)
-    g->impl = CVMCRYPT_GCM_IMPL_PMULL;
-#else
-    g->impl = CVMCRYPT_GCM_IMPL_SCALAR;
-#endif
-
-#if defined(__aarch64__)
-    /* Build reflected-domain power table for 8-block GHASH. */
-    if (g->impl == CVMCRYPT_GCM_IMPL_PMULL) {
-        gcm_asm_setup(g, keylen);
-        g->asm_ok = true; /* AES-128/192/256 all verified */
+static bool gcm_setup(CvmcryptGcm* g, u8 const* key, usize keylen, u8 const iv[12]) {
+    if (!gcm_key_setup(g, key, keylen)) {
+        return false;
     }
-#endif
-
+    gcm_msg_reset(g, iv);
     return true;
 }
 
@@ -236,13 +242,10 @@ static void gcm_crypt(CvmcryptGcm* g, u8 const* in, usize len, u8* out) {
     }
 }
 
-bool cvmcrypt_gcm_encrypt(CvmcryptGcm* g, u8 const* key, usize keylen, u8 const iv[12],
-                          u8 const* aad, usize aadlen, u8 const* pt, usize ptlen,
-                          u8* ct, u8 tag[16]) {
-    if (!gcm_setup(g, key, keylen, iv)) {
-        return false;
-    }
-
+/* Message body: assumes key-derived state is in place and the message
+ * state has been reset. */
+static void gcm_seal_body(CvmcryptGcm* g, u8 const* aad, usize aadlen, u8 const* pt,
+                          usize ptlen, u8* ct, u8 tag[16]) {
     /* Absorb AAD. */
     if (aad && aadlen > 0) {
         ghash_update(g, aad, aadlen, &g->aadlen);
@@ -299,18 +302,41 @@ bool cvmcrypt_gcm_encrypt(CvmcryptGcm* g, u8 const* key, usize keylen, u8 const 
     for (usize i = 0; i < 16; i++) {
         tag[i] = ekJ0[i] ^ g->X[i];
     }
+}
 
+bool cvmcrypt_gcm_setup(CvmcryptGcm* g, u8 const* key, usize keylen) {
+    return gcm_key_setup(g, key, keylen);
+}
+
+bool cvmcrypt_gcm_seal(CvmcryptGcm* g, u8 const iv[12], u8 const* aad, usize aadlen,
+                       u8 const* pt, usize ptlen, u8* ct, u8 tag[16]) {
+    gcm_msg_reset(g, iv);
+    gcm_seal_body(g, aad, aadlen, pt, ptlen, ct, tag);
+    return true;
+}
+
+void cvmcrypt_gcm_clear(CvmcryptGcm* g) {
+    volatile u8* p = (volatile u8*)g;
+    for (usize i = 0; i < sizeof(*g); i++) {
+        p[i] = 0;
+    }
+}
+
+bool cvmcrypt_gcm_encrypt(CvmcryptGcm* g, u8 const* key, usize keylen, u8 const iv[12],
+                          u8 const* aad, usize aadlen, u8 const* pt, usize ptlen,
+                          u8* ct, u8 tag[16]) {
+    if (!gcm_setup(g, key, keylen, iv)) {
+        return false;
+    }
+    gcm_seal_body(g, aad, aadlen, pt, ptlen, ct, tag);
     memset(g, 0, sizeof(*g));
     return true;
 }
 
-bool cvmcrypt_gcm_decrypt(CvmcryptGcm* g, u8 const* key, usize keylen, u8 const iv[12],
-                          u8 const* aad, usize aadlen, u8 const* ct, usize ctlen,
-                          u8* pt, u8 const tag[16]) {
-    if (!gcm_setup(g, key, keylen, iv)) {
-        return false;
-    }
-
+/* Message body: assumes key-derived state is in place and the message
+ * state has been reset. */
+static bool gcm_open_body(CvmcryptGcm* g, u8 const* aad, usize aadlen, u8 const* ct,
+                          usize ctlen, u8* pt, u8 const tag[16]) {
     /* Absorb AAD. */
     if (aad && aadlen > 0) {
         ghash_update(g, aad, aadlen, &g->aadlen);
@@ -347,7 +373,6 @@ bool cvmcrypt_gcm_decrypt(CvmcryptGcm* g, u8 const* key, usize keylen, u8 const 
 
     /* Constant-time tag comparison. */
     if (!cvmcrypt_ct_eq(expected, tag, 16)) {
-        memset(g, 0, sizeof(*g));
         if (pt && ctlen > 0) {
             memset(pt, 0, ctlen);
         }
@@ -361,7 +386,22 @@ bool cvmcrypt_gcm_decrypt(CvmcryptGcm* g, u8 const* key, usize keylen, u8 const 
 
     memcpy(g->counter, ctr, 16);
     gcm_crypt(g, ct, ctlen, pt);
-
-    memset(g, 0, sizeof(*g));
     return true;
+}
+
+bool cvmcrypt_gcm_open(CvmcryptGcm* g, u8 const iv[12], u8 const* aad, usize aadlen,
+                       u8 const* ct, usize ctlen, u8* pt, u8 const tag[16]) {
+    gcm_msg_reset(g, iv);
+    return gcm_open_body(g, aad, aadlen, ct, ctlen, pt, tag);
+}
+
+bool cvmcrypt_gcm_decrypt(CvmcryptGcm* g, u8 const* key, usize keylen, u8 const iv[12],
+                          u8 const* aad, usize aadlen, u8 const* ct, usize ctlen,
+                          u8* pt, u8 const tag[16]) {
+    if (!gcm_setup(g, key, keylen, iv)) {
+        return false;
+    }
+    bool ok = gcm_open_body(g, aad, aadlen, ct, ctlen, pt, tag);
+    memset(g, 0, sizeof(*g));
+    return ok;
 }

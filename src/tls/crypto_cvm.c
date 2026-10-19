@@ -156,9 +156,10 @@ static void cvm_gcm_encrypt(CvmTlsAead* _ctx, u8* output, u8 const* input, usize
     memcpy(nonce, ctx->static_iv, 12);
     for (int i = 0; i < 8; i++)
         nonce[i] ^= (u8)(seq >> (56 - i * 8));
-    /* output = ciphertext || tag */
-    cvmcrypt_gcm_encrypt(&ctx->gcm, ctx->key, 16, nonce, (u8 const*)aad, aadlen, input,
-                         inlen, output, output + inlen);
+    /* output = ciphertext || tag. Key-derived state was built once in
+     * setup, so this is just the per-message work. */
+    cvmcrypt_gcm_seal(&ctx->gcm, nonce, (u8 const*)aad, aadlen, input, inlen, output,
+                      output + inlen);
 }
 
 static usize cvm_gcm_decrypt(CvmTlsAead* _ctx, u8* output, u8 const* input, usize inlen,
@@ -169,9 +170,8 @@ static usize cvm_gcm_decrypt(CvmTlsAead* _ctx, u8* output, u8 const* input, usiz
     for (int i = 0; i < 8; i++)
         nonce[i] ^= (u8)(seq >> (56 - i * 8));
     /* input = ciphertext || tag */
-    bool ok =
-        cvmcrypt_gcm_decrypt(&ctx->gcm, ctx->key, 16, nonce, (u8 const*)aad, aadlen,
-                             input, inlen - 16, output, input + inlen - 16);
+    bool ok = cvmcrypt_gcm_open(&ctx->gcm, nonce, (u8 const*)aad, aadlen, input,
+                                inlen - 16, output, input + inlen - 16);
     return ok ? inlen - 16 : (usize)-1;
 }
 
@@ -189,6 +189,10 @@ static CvmTlsAead* cvm_gcm128_setup(CvmTlsAeadAlgo const* algo, bool is_enc,
     ctx->super.do_decrypt = cvm_gcm_decrypt;
     memcpy(ctx->key, key, 16);
     memcpy(ctx->static_iv, iv, 12);
+    if (!cvmcrypt_gcm_setup(&ctx->gcm, ctx->key, 16)) {
+        cvmcrypt_secure_free(ctx, sizeof(*ctx));
+        return NULL;
+    }
     return &ctx->super;
 }
 
@@ -220,8 +224,8 @@ static void cvm_gcm256_encrypt(CvmTlsAead* _ctx, u8* output, u8 const* input,
     memcpy(nonce, ctx->static_iv, 12);
     for (int i = 0; i < 8; i++)
         nonce[i] ^= (u8)(seq >> (56 - i * 8));
-    cvmcrypt_gcm_encrypt(&ctx->gcm, ctx->key, 32, nonce, (u8 const*)aad, aadlen, input,
-                         inlen, output, output + inlen);
+    cvmcrypt_gcm_seal(&ctx->gcm, nonce, (u8 const*)aad, aadlen, input, inlen, output,
+                      output + inlen);
 }
 
 static usize cvm_gcm256_decrypt(CvmTlsAead* _ctx, u8* output, u8 const* input,
@@ -231,9 +235,8 @@ static usize cvm_gcm256_decrypt(CvmTlsAead* _ctx, u8* output, u8 const* input,
     memcpy(nonce, ctx->static_iv, 12);
     for (int i = 0; i < 8; i++)
         nonce[i] ^= (u8)(seq >> (56 - i * 8));
-    bool ok =
-        cvmcrypt_gcm_decrypt(&ctx->gcm, ctx->key, 32, nonce, (u8 const*)aad, aadlen,
-                             input, inlen - 16, output, input + inlen - 16);
+    bool ok = cvmcrypt_gcm_open(&ctx->gcm, nonce, (u8 const*)aad, aadlen, input,
+                                inlen - 16, output, input + inlen - 16);
     return ok ? inlen - 16 : (usize)-1;
 }
 
@@ -251,6 +254,10 @@ static CvmTlsAead* cvm_gcm256_setup(CvmTlsAeadAlgo const* algo, bool is_enc,
     ctx->super.do_decrypt = cvm_gcm256_decrypt;
     memcpy(ctx->key, key, 32);
     memcpy(ctx->static_iv, iv, 12);
+    if (!cvmcrypt_gcm_setup(&ctx->gcm, ctx->key, 32)) {
+        cvmcrypt_secure_free(ctx, sizeof(*ctx));
+        return NULL;
+    }
     return &ctx->super;
 }
 

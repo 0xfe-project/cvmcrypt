@@ -53,6 +53,26 @@ enum {
     CVMCRYPT_GCM_IMPL_PMULL = 1, /* aarch64 polynomial multiply */
 };
 
+/* ------------------------------------------------------------------ */
+/* Keyed interface                                                      */
+/*                                                                      */
+/* The key schedule and the GHASH table dominate setup (~290 ns), which */
+/* is 14% of a 16 KB TLS record. A connection reuses one key, so build  */
+/* the key-derived state once with _setup() and then _seal()/_open()    */
+/* per record; those only reset the per-message state.                  */
+/* ------------------------------------------------------------------ */
+
+bool cvmcrypt_gcm_setup(CvmcryptGcm* g, u8 const* key, usize keylen);
+
+bool cvmcrypt_gcm_seal(CvmcryptGcm* g, u8 const iv[12], u8 const* aad, usize aadlen,
+                       u8 const* pt, usize ptlen, u8* ct, u8 tag[16]);
+
+bool cvmcrypt_gcm_open(CvmcryptGcm* g, u8 const iv[12], u8 const* aad, usize aadlen,
+                       u8 const* ct, usize ctlen, u8* pt, u8 const tag[16]);
+
+/* Zeroise the whole context, key-derived state included. */
+void cvmcrypt_gcm_clear(CvmcryptGcm* g);
+
 /*
  * One-shot AES-GCM encrypt. Produces ciphertext and a 16-byte tag.
  * iv is 12 bytes (the TLS 1.3 case); other lengths hash the IV.
