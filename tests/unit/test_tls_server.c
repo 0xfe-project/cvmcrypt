@@ -124,12 +124,45 @@ static int dummy_keyex_create(CvmTlsKeyexCtx** ctx) {
     memset(*ctx, 0, sizeof(**ctx));
     return 0;
 }
+/* The server derives the handshake secret from what this returns. */
+static int dummy_keyex_exchange(CvmTlsKeyexCtx* ctx, CvmTlsVec* secret,
+                                CvmTlsVec peer_pubkey) {
+    (void)peer_pubkey;
+    u8* shared = rt_mem_alloc(32);
+    if (!shared)
+        return TLS_ERROR_NO_MEMORY;
+    memset(shared, 0x5a, 32);
+    secret->base = shared;
+    secret->len = 32;
+    rt_mem_free(ctx);
+    return 0;
+}
+
 static CvmTlsKeyexAlgo const DUMMY_KEYEX = {
     .name = "x25519",
     .id = TLS_GROUP_X25519,
     .shared_secret_size = 32,
     .create = dummy_keyex_create,
+    .exchange = dummy_keyex_exchange,
 };
+
+/* The embedder signs; cvmcrypt holds no private key. 0 is success. */
+static int dummy_sign(struct CvmTlsSignCert* self, CvmTls* tls, u16* selected_algorithm,
+                      CvmTlsBuf* output, CvmTlsVec input, u16 const* algorithms,
+                      usize num_algorithms) {
+    (void)self;
+    (void)tls;
+    (void)input;
+    (void)algorithms;
+    (void)num_algorithms;
+    *selected_algorithm = TLS_SIGNATURE_ECDSA_SECP256R1_SHA256;
+    for (usize i = 0; i < 8; i++) {
+        if (cvm_tls_buf_push(output, (u8)(0xa0 + i)) != 0)
+            return -1;
+    }
+    return 0;
+}
+static CvmTlsSignCert const SIGN_CERT = {.cb = dummy_sign};
 
 static CvmTlsCipherSuite const SUITE = {
     .id = TLS_CIPHER_SUITE_AES_128_GCM_SHA256,
@@ -185,6 +218,7 @@ TEST server_full_handshake_flow(void) {
     ctx.get_time = (CvmTlsGetTime*)&GET_TIME;
     ctx.random_bytes = (CvmTlsRandomBytes*)&RANDOM;
     ctx.certificates = (CvmTlsCert*)CERTS;
+    ctx.sign_certificate = (CvmTlsSignCert*)&SIGN_CERT;
 
     CvmTls* tls = cvm_tls_new(&ctx, true, NULL);
     ASSERT(tls != NULL);
@@ -228,6 +262,7 @@ TEST server_cipher_suite_negotiated(void) {
     ctx.get_time = (CvmTlsGetTime*)&GET_TIME;
     ctx.random_bytes = (CvmTlsRandomBytes*)&RANDOM;
     ctx.certificates = (CvmTlsCert*)CERTS;
+    ctx.sign_certificate = (CvmTlsSignCert*)&SIGN_CERT;
 
     CvmTls* tls = cvm_tls_new(&ctx, true, NULL);
 

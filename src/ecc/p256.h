@@ -47,8 +47,6 @@ bool cvmcrypt_ecdsa_verify(CvmEcPoint const* q, u8 const* hash, usize hash_len,
  * Accepts P-256 (1.2.840.10045.3.1.7) and P-384 (1.3.132.0.34). */
 EcStatus cvmcrypt_ec_import_spki(CvmEcPoint* pt, u8 const* der, usize derlen);
 
-#endif /* CVMCRYPT_ECC_P256_H */
-
 /* ------------------------------------------------------------------ */
 /* ECDSA sign (server side)                                             */
 /* ------------------------------------------------------------------ */
@@ -70,3 +68,5 @@ EcStatus cvmcrypt_ec_priv_import_pkcs8(CvmEcPriv* key, u8 const* der, usize derl
 bool cvmcrypt_ecdsa_sign(CvmEcPriv const* key, u8 const* hash, usize hash_len,
                          u8 const* k, usize k_len, /* random nonce */
                          u8* r_out, u8* s_out);    /* coord_len each */
+
+#endif /* CVMCRYPT_ECC_P256_H */

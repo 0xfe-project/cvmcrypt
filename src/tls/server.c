@@ -7,6 +7,13 @@
  */
 
 #include "tls/tls_conn.h"
+
+#ifdef TLS_TRACE
+#include <stdio.h>
+#define TRACE(...) fprintf(stderr, "[srv] " __VA_ARGS__), fprintf(stderr, "\n")
+#else
+#define TRACE(...) ((void)0)
+#endif
 #include "tls/handshake.h"
 #include "tls/keyschedule.h"
 #include "base/mem.h"
@@ -115,15 +122,41 @@ static int server_handle_client_hello(CvmTls* tls, CvmTlsBuf* sendbuf,
     /* Build ServerHello. */
     CvmTlsBuf sh_buf;
     cvm_tls_buf_init(&sh_buf, NULL, 0);
-    CvmTlsKeyexAlgo const* keyex = tls->ctx->key_exchanges[0];
-    /* Server key_share pubkey: TODO get from keyex exchange (t43). */
-    u8 server_pubkey[32];
-    memset(server_pubkey, 0x33, 32); /* placeholder until crypto callbacks */
+    /*
+     * Pick the group the client offered a key share for. Replying with a
+     * group it did not offer gets the handshake rejected.
+     */
+    CvmTlsKeyexAlgo const* keyex = NULL;
+    CvmTlsKeyShareEntry const* peer_share = NULL;
+    for (usize j = 0; j < ch.num_key_shares && keyex == NULL; j++) {
+        for (usize i = 0; tls->ctx->key_exchanges[i] != NULL; i++) {
+            if (tls->ctx->key_exchanges[i]->id == ch.key_shares[j].group) {
+                keyex = tls->ctx->key_exchanges[i];
+                peer_share = &ch.key_shares[j];
+                break;
+            }
+        }
+    }
+    TRACE("client offered %zu shares, picked group=%u keyex=%p", ch.num_key_shares,
+          peer_share ? (unsigned)peer_share->group : 0, (void*)keyex);
+    if (keyex == NULL || peer_share == NULL)
+        return TLS_ALERT_HANDSHAKE_FAILURE;
+
+    ret = keyex->create(&tls->keyex_ctx);
+    TRACE("keyex create ret=%d pubkey_len=%zu", ret,
+          tls->keyex_ctx ? tls->keyex_ctx->pubkey_len : 0);
+    if (ret != 0)
+        goto fail;
+    tls->keyex_pubkey_len = tls->keyex_ctx->pubkey_len;
+    if (tls->keyex_pubkey_len > sizeof(tls->keyex_pubkey))
+        tls->keyex_pubkey_len = sizeof(tls->keyex_pubkey);
+    memcpy(tls->keyex_pubkey, tls->keyex_ctx->pubkey, tls->keyex_pubkey_len);
 
     ret = cvm_tls_encode_server_hello(
         &sh_buf, tls->suite, tls->server_random,
         (CvmTlsVec){tls->legacy_session_id, tls->legacy_session_id_len}, keyex,
-        (CvmTlsVec){server_pubkey, 32});
+        (CvmTlsVec){tls->keyex_pubkey, tls->keyex_pubkey_len});
+    TRACE("encode ServerHello ret=%d len=%zu", ret, sh_buf.off);
     if (ret != 0)
         goto fail;
 
@@ -141,8 +174,18 @@ static int server_handle_client_hello(CvmTls* tls, CvmTlsBuf* sendbuf,
     ret = cvm_tls_ks_extract(&tls->ks, (CvmTlsVec){NULL, 0}); /* early */
     if (ret != 0)
         goto fail;
-    ret = cvm_tls_ks_extract(&tls->ks,
-                             (CvmTlsVec){NULL, 0}); /* handshake (TODO: ECDHE) */
+    CvmTlsVec shared = {NULL, 0};
+    ret = keyex->exchange(tls->keyex_ctx, &shared, peer_share->key_exchange);
+    tls->keyex_ctx = NULL; /* exchange consumes it */
+    TRACE("exchange ret=%d shared_len=%zu", ret, shared.len);
+    if (ret != 0)
+        goto fail;
+    ret = cvm_tls_ks_extract(&tls->ks, shared);
+    TRACE("ks extract (handshake) ret=%d", ret);
+    if (shared.base != NULL) {
+        memset((void*)shared.base, 0, shared.len);
+        rt_mem_free((void*)shared.base);
+    }
     if (ret != 0)
         goto fail;
 
@@ -231,8 +274,8 @@ static int server_handle_client_hello(CvmTls* tls, CvmTlsBuf* sendbuf,
 
     /* Send CertificateVerify. */
     {
-        /* TODO: actually sign (t43 crypto callbacks + t44 signing).
-         * For now, send a dummy signature to complete the message flow. */
+        /* The signature is the embedder's: cvmcrypt never holds a private
+         * key. The callback picks the scheme and writes the signature. */
         u8 transcript_hash[TLS_MAX_DIGEST_SIZE];
         tls->ks.hash_ctx->final(tls->ks.hash_ctx, transcript_hash,
                                 TLS_HASH_FINAL_SNAPSHOT);
@@ -243,20 +286,38 @@ static int server_handle_client_hello(CvmTls* tls, CvmTlsBuf* sendbuf,
                                        "TLS 1.3, server CertificateVerify",
                                        transcript_hash, 32);
 
-        /* Sign: use dummy for now — real signing in t43. */
-        u8 sig[256];
-        usize sig_len = 256;
-        memset(sig, 0x42, sig_len); /* placeholder */
+        if (tls->ctx->sign_certificate == NULL ||
+            tls->ctx->sign_certificate->cb == NULL) {
+            TRACE("no sign_certificate callback");
+            ret = TLS_ALERT_INTERNAL_ERROR;
+            goto fail;
+        }
+
+        CvmTlsBuf sig_buf;
+        cvm_tls_buf_init(&sig_buf, NULL, 0);
+        u16 sig_alg = 0;
+        ret = tls->ctx->sign_certificate->cb(
+            tls->ctx->sign_certificate, tls, &sig_alg, &sig_buf,
+            (CvmTlsVec){sign_input, sign_input_len}, NULL, 0);
+        TRACE("sign cb ret=%d alg=%04x sig_len=%zu", ret, (unsigned)sig_alg,
+              sig_buf.off);
+        if (ret != 0) {
+            cvm_tls_buf_dispose(&sig_buf);
+            goto fail;
+        }
 
         CvmTlsBuf cv_buf;
         cvm_tls_buf_init(&cv_buf, NULL, 0);
-        ret = cvm_tls_encode_certificate_verify(
-            &cv_buf, TLS_SIGNATURE_RSA_PSS_RSAE_SHA256, (CvmTlsVec){sig, sig_len});
+        ret = cvm_tls_encode_certificate_verify(&cv_buf, sig_alg,
+                                                (CvmTlsVec){sig_buf.base, sig_buf.off});
+        cvm_tls_buf_dispose(&sig_buf);
+        TRACE("encode CV ret=%d len=%zu", ret, cv_buf.off);
         if (ret != 0) {
             cvm_tls_buf_dispose(&cv_buf);
             goto fail;
         }
         ret = push_encrypted_message(tls, sendbuf, cv_buf.base, cv_buf.off);
+        TRACE("push CV ret=%d", ret);
         cvm_tls_buf_dispose(&cv_buf);
         if (ret != 0)
             goto fail;
@@ -280,6 +341,7 @@ static int server_handle_client_hello(CvmTls* tls, CvmTlsBuf* sendbuf,
             goto fail;
         }
         ret = push_encrypted_message(tls, sendbuf, fin_buf.base, fin_buf.off);
+        TRACE("push Finished ret=%d", ret);
         cvm_tls_buf_dispose(&fin_buf);
         if (ret != 0)
             goto fail;
@@ -306,8 +368,29 @@ static int server_handle_finished(CvmTls* tls, CvmTlsVec message) {
     if (ret != 0)
         return ret;
 
-    /* Verify client's Finished (TODO: proper transcript hash). */
-    /* For now: derive application secrets and complete. */
+    /* Verify the client's Finished against the transcript as it stands now,
+     * which excludes this message. */
+    {
+        usize const dlen = tls->suite->hash->digest_size;
+        u8 expected[TLS_MAX_DIGEST_SIZE];
+        ret = cvm_tls_ks_calc_verify_data(&tls->ks, expected, tls->client_hs_secret);
+        if (ret != 0)
+            return ret;
+        bool const ok = fin.verify_data.len == dlen &&
+                        cvmcrypt_ct_eq(fin.verify_data.base, expected, dlen);
+        memset(expected, 0, sizeof(expected));
+        TRACE("client Finished verify ok=%d", (int)ok);
+        if (!ok)
+            return TLS_ALERT_DECRYPT_ERROR;
+    }
+
+    /*
+     * The application secrets are derived from the transcript through the
+     * server's Finished — the client's Finished is NOT in it (RFC 8446
+     * §7.1). Hashing it first derives keys that no peer will ever use, and
+     * the failure surfaces one step later as a bad record MAC on the first
+     * application data record.
+     */
     ret = cvm_tls_ks_extract(&tls->ks, (CvmTlsVec){NULL, 0}); /* master */
     if (ret != 0)
         return ret;
@@ -346,6 +429,9 @@ static int server_handle_finished(CvmTls* tls, CvmTlsVec message) {
 
         memset(key, 0, sizeof(key));
     }
+
+    /* Only now does the client's Finished join the transcript. */
+    cvm_tls_ks_update_hash(&tls->ks, message.base, message.len);
 
     tls->state = TLS_STATE_SERVER_POST_HANDSHAKE;
     tls->handshake_complete = true;

@@ -94,9 +94,10 @@ TEST client_hello_roundtrip(void) {
     ASSERT_EQ(2, ch.num_cipher_suites);
     ASSERT_EQ(TLS_CIPHER_SUITE_AES_128_GCM_SHA256, ch.cipher_suites[0]);
     ASSERT_EQ(TLS_CIPHER_SUITE_CHACHA20_POLY1305_SHA256, ch.cipher_suites[1]);
-    ASSERT_EQ(TLS_GROUP_X25519, ch.key_share.group);
-    ASSERT_EQ(32, ch.key_share.key_exchange.len);
-    ASSERT(memcmp(ch.key_share.key_exchange.base, pubkey, 32) == 0);
+    ASSERT_EQ(1, ch.num_key_shares);
+    ASSERT_EQ(TLS_GROUP_X25519, ch.key_shares[0].group);
+    ASSERT_EQ(32, ch.key_shares[0].key_exchange.len);
+    ASSERT(memcmp(ch.key_shares[0].key_exchange.base, pubkey, 32) == 0);
     ASSERT_EQ(TLS_PROTOCOL_VERSION_TLS13, ch.negotiated_version);
 
     cvm_tls_buf_dispose(&buf);

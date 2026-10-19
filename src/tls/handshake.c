@@ -648,7 +648,15 @@ int cvm_tls_decode_client_hello(CvmTlsClientHello* ch, u8 const* src, u8 const* 
         case TLS_EXTENSION_TYPE_KEY_SHARE: {
             u16 ks_list_len;
             if (tls_decode16(&ks_list_len, &eb, eb_end) == 0) {
-                decode_key_share(&ch->key_share, &eb, eb_end);
+                u8 const* list_end = eb + ks_list_len;
+                if (list_end > eb_end)
+                    list_end = eb_end;
+                while (eb < list_end && ch->num_key_shares < 8) {
+                    if (decode_key_share(&ch->key_shares[ch->num_key_shares], &eb,
+                                         list_end) != 0)
+                        break;
+                    ch->num_key_shares++;
+                }
             }
             break;
         }

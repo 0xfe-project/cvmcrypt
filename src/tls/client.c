@@ -800,9 +800,14 @@ int cvm_tls_handshake(CvmTls* tls, CvmTlsBuf* sendbuf, void const* input, usize*
                 if (ret != 0)
                     break;
 
-                /* Reconstruct full message for the state machine. */
+                /* Reconstruct full message for the state machine. A server
+                 * runs a different machine over the same record layer; it
+                 * used to fall through to the client's, hit its default arm
+                 * and return INTERNAL_ERROR, which is why the server never
+                 * completed a handshake with anyone. */
                 CvmTlsVec msg = {hs - body.len - 4, body.len + 4};
-                ret = client_handle_message(tls, sendbuf, msg);
+                ret = tls->is_server ? cvm_tls_server_handle_message(tls, sendbuf, msg)
+                                     : client_handle_message(tls, sendbuf, msg);
                 if (ret != 0)
                     break;
             }
@@ -1058,7 +1063,8 @@ int cvm_tls_handle_message(CvmTls* tls, CvmTlsBuf* sendbuf, usize epoch_offsets[
         tls->write_epoch = in_epoch;
 
         CvmTlsVec msg = {(u8*)src, 4 + mlen};
-        ret = client_handle_message(tls, sendbuf, msg);
+        ret = tls->is_server ? cvm_tls_server_handle_message(tls, sendbuf, msg)
+                             : client_handle_message(tls, sendbuf, msg);
         if (ret != 0) {
             tls->recvbuf_msg.off = 0;
             return ret;

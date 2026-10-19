@@ -31,7 +31,14 @@ typedef struct CvmTlsClientHello {
 
     /* Extensions we care about. */
     char const* server_name; /* SNI, NULL if absent */
-    CvmTlsKeyShareEntry key_share;
+    /*
+     * Every key_share entry the client offered, in order. A client may send
+     * several — OpenSSL 4 offers X25519MLKEM768 (0x11ec) first and x25519
+     * second — so the server must scan the list for a group it supports
+     * instead of taking the first entry.
+     */
+    CvmTlsKeyShareEntry key_shares[8];
+    usize num_key_shares;
     u16 negotiated_version; /* from supported_versions ext */
 
     /* Raw message (including header) for transcript hash. */

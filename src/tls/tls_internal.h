@@ -95,6 +95,9 @@ CVM_INLINE void tls_build_aad(u8 aad[5], usize reclen) {
     aad[4] = (u8)reclen;
 }
 
+/* The server's state machine. Same record layer, different machine. */
+int cvm_tls_server_handle_message(CvmTls* tls, CvmTlsBuf* sendbuf, CvmTlsVec message);
+
 usize cvm_tls_aead_encrypt(CvmTlsTrafficProt* ctx, u8* output, u8 const* input,
                            usize inlen, u8 content_type);
 int cvm_tls_aead_decrypt(CvmTlsTrafficProt* ctx, u8* output, usize* outlen,
