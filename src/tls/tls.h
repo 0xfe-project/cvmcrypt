@@ -444,6 +444,11 @@ int cvm_tls_send_alert(CvmTls* tls, CvmTlsBuf* sendbuf, u8 level, u8 description
 int cvm_tls_quic_set_local_transport_params(CvmTls* tls, u8 const* data, usize len);
 CvmTlsVec cvm_tls_quic_remote_transport_params(CvmTls const* tls);
 
+/* ALPN protocols to offer. Must be set before the handshake starts; QUIC
+ * requires at least one or the server aborts. The array is referenced, not
+ * copied, so it must outlive the session. */
+void cvm_tls_set_alpn(CvmTls* tls, CvmTlsVec const* alpns, usize nalpn);
+
 /* True once the session has run in QUIC mode (no record layer). */
 bool cvm_tls_is_quic(CvmTls const* tls);
 

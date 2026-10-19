@@ -60,6 +60,9 @@ struct CvmTls {
      * over in a stack buffer that is gone by the time ClientHello is built. */
     u8 local_quic_params[TLS_MAX_QUIC_PARAMS_SIZE];
     usize local_quic_params_len;
+    /* ALPN protocols offered in ClientHello, owned by the caller. */
+    CvmTlsVec const* alpns;
+    usize nalpn;
     /* Peer's transport parameters, copied out of EncryptedExtensions. */
     u8 remote_quic_params[TLS_MAX_QUIC_PARAMS_SIZE];
     usize remote_quic_params_len;

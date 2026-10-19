@@ -66,14 +66,20 @@ void cvm_tls_free(CvmTls* tls) {
  * range for epoch e is [offsets[e], offsets[e+1]).
  */
 static void quic_note_emit(CvmTls* tls, CvmTlsBuf* buf, usize start) {
+    (void)start;
     if (!tls->quic || tls->epoch_offsets == NULL)
         return;
-    /* Close every level below this one so the ranges are contiguous. */
-    for (usize e = 0; e < tls->write_epoch; e++) {
-        if (tls->epoch_offsets[e + 1] == 0)
-            tls->epoch_offsets[e + 1] = start;
+
+    /*
+     * Every boundary at or above this level moves to the current end. Leaving
+     * the higher ones at zero makes the caller compute `0 - offset` for the
+     * empty levels, which underflows to SIZE_MAX and looks like a gigantic
+     * epoch. Levels emitted later overwrite the ones above them, so the
+     * ordering still yields contiguous ranges.
+     */
+    for (usize e = tls->write_epoch + 1; e < 5; e++) {
+        tls->epoch_offsets[e] = buf->off;
     }
-    tls->epoch_offsets[tls->write_epoch + 1] = buf->off;
 }
 
 static int emit_handshake(CvmTls* tls, CvmTlsBuf* sendbuf, u8 const* msg, usize len) {
@@ -195,7 +201,8 @@ static int client_send_client_hello(CvmTls* tls, CvmTlsBuf* sendbuf) {
         (CvmTlsVec){tls->legacy_session_id, 32}, tls->server_name, keyex,
         (CvmTlsVec){tls->keyex_pubkey, tls->keyex_pubkey_len}, NULL, 0,
         tls->quic ? (CvmTlsVec){tls->local_quic_params, tls->local_quic_params_len}
-                  : (CvmTlsVec){NULL, 0});
+                  : (CvmTlsVec){NULL, 0},
+        tls->alpns, tls->nalpn);
     if (ret != 0)
         return ret;
 
@@ -843,6 +850,13 @@ CvmTlsVec cvm_tls_quic_remote_transport_params(CvmTls const* tls) {
     if (tls == NULL)
         return (CvmTlsVec){NULL, 0};
     return (CvmTlsVec){tls->remote_quic_params, tls->remote_quic_params_len};
+}
+
+void cvm_tls_set_alpn(CvmTls* tls, CvmTlsVec const* alpns, usize nalpn) {
+    if (tls == NULL)
+        return;
+    tls->alpns = alpns;
+    tls->nalpn = alpns != NULL ? nalpn : 0;
 }
 
 bool cvm_tls_is_quic(CvmTls const* tls) {

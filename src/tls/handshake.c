@@ -108,13 +108,11 @@ static int push_vec16(CvmTlsBuf* buf, CvmTlsVec v) {
 /* ClientHello encode                                                   */
 /* ------------------------------------------------------------------ */
 
-int cvm_tls_encode_client_hello(CvmTlsBuf* buf,
-                                CvmTlsCipherSuite const* const* cipher_suites,
-                                u8 const random[32], CvmTlsVec legacy_session_id,
-                                char const* server_name, CvmTlsKeyexAlgo const* keyex,
-                                CvmTlsVec keyex_pubkey, CvmTlsVec* psk_identity,
-                                u32 psk_obfuscated_ticket_age,
-                                CvmTlsVec quic_transport_params) {
+int cvm_tls_encode_client_hello(
+    CvmTlsBuf* buf, CvmTlsCipherSuite const* const* cipher_suites, u8 const random[32],
+    CvmTlsVec legacy_session_id, char const* server_name, CvmTlsKeyexAlgo const* keyex,
+    CvmTlsVec keyex_pubkey, CvmTlsVec* psk_identity, u32 psk_obfuscated_ticket_age,
+    CvmTlsVec quic_transport_params, CvmTlsVec const* alpns, usize nalpn) {
     int ret;
     usize hdr_start, ext_start;
     (void)psk_identity;
@@ -303,6 +301,26 @@ int cvm_tls_encode_client_hello(CvmTlsBuf* buf,
         if ((ret = cvm_tls_buf_push(buf, TLS_PSK_KE_MODE_PSK_DHE_KEY_EXCHANGE)) != 0)
             return ret;
         fix_block16(buf, pk_start);
+    }
+
+    /* ALPN — extension 16. QUIC requires it; a server configured with a
+     * protocol list aborts the handshake when the client offers none. */
+    if (alpns != NULL && nalpn > 0) {
+        usize alpn_start, list_start;
+        if ((ret = cvm_tls_buf_push(buf, 0)) != 0)
+            return ret;
+        if ((ret = cvm_tls_buf_push(buf, 16)) != 0)
+            return ret;
+        if ((ret = push_block16(buf, &alpn_start)) != 0)
+            return ret;
+        if ((ret = push_block16(buf, &list_start)) != 0)
+            return ret;
+        for (usize i = 0; i < nalpn; i++) {
+            if ((ret = push_vec8(buf, alpns[i])) != 0)
+                return ret;
+        }
+        fix_block16(buf, list_start);
+        fix_block16(buf, alpn_start);
     }
 
     /* quic_transport_parameters — extension 57 (0x39). A QUIC peer aborts the
