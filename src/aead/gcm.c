@@ -38,14 +38,23 @@ extern void aes_gcm_dec_kernel(u8 const* in, u64 in_len, u8* out, u8* xi, u8* iv
  *  - it returns 0 and does nothing when len < 288, so short messages fall
  *    back to the portable path
  *  - the x86 Htable is not interchangeable with the arm64 one */
-extern void gcm_init_clmul(u8 htable[256], u8 const h[16]);
-extern void gcm_ghash_clmul(u8 xi[16], u8 const htable[256], u8 const* in, usize len);
+extern void gcm_init_avx(u8 htable[256], u8 const h[16]);
+extern void gcm_ghash_avx(u8 xi[16], u8 const htable[256], u8 const* in, usize len);
 extern usize aesni_gcm_encrypt(u8 const* in, u8* out, usize len, void const* key,
                                u8 ivec[16], void const* htable, u64* xi);
 extern usize aesni_gcm_decrypt(u8 const* in, u8* out, usize len, void const* key,
                                u8 ivec[16], void const* htable, u64* xi);
 
-__attribute__((unused)) static u8 gcm_x86_has_asm(void) {
+/* The kernels are the AVX-encoded variants and their GHASH table comes
+ * from gcm_init_avx, so AVX (not just SSE) is required, together with the
+ * OS having enabled YMM state. */
+static u8 gcm_x86_has_asm(void) {
+#ifdef CVMCRYPT_GCM_FORCE_ASM
+    /* Test hook only: Rosetta executes VEX instructions but reports
+     * CPUID AVX=0, so the honest gate would hide the asm path from
+     * local verification. Never define this in a shipped build. */
+    return 1;
+#endif
     u32 a, b, c, d;
     __asm__ volatile("cpuid" : "=a"(a), "=b"(b), "=c"(c), "=d"(d) : "a"(1), "c"(0));
     (void)a;
@@ -54,7 +63,16 @@ __attribute__((unused)) static u8 gcm_x86_has_asm(void) {
     u8 aesni = (u8)((c >> 25) & 1);
     u8 pclmul = (u8)((c >> 1) & 1);
     u8 ssse3 = (u8)((c >> 9) & 1);
-    return (u8)(aesni && pclmul && ssse3);
+    u8 osxsave = (u8)((c >> 27) & 1);
+    u8 avx = (u8)((c >> 28) & 1);
+    if (!(aesni && pclmul && ssse3 && osxsave && avx)) {
+        return 0;
+    }
+    /* XCR0[2:1] = SSE|YMM state saved by the OS. */
+    u32 xcr0_lo, xcr0_hi;
+    __asm__ volatile("xgetbv" : "=a"(xcr0_lo), "=d"(xcr0_hi) : "c"(0));
+    (void)xcr0_hi;
+    return (u8)((xcr0_lo & 0x6) == 0x6);
 }
 #endif
 
@@ -107,7 +125,7 @@ static void gf128_mul(CvmcryptGcm* g, u8 const* a, u8 const* b, u8* out) {
         (void)b;
         static u8 const zero[16] = {0};
         memcpy(out, a, 16);
-        gcm_ghash_clmul(out, g->htable, zero, 16);
+        gcm_ghash_avx(out, g->htable, zero, 16);
         return;
     }
 #else
@@ -220,7 +238,11 @@ static void gcm_asm_setup(CvmcryptGcm* g, usize keylen) {
         hin[i] = g->H[7 - i];
         hin[8 + i] = g->H[15 - i];
     }
+#if defined(__x86_64__)
+    gcm_init_avx(g->htable, hin);
+#else
     gcm_init_clmul(g->htable, hin);
+#endif
 #else
     (void)g;
 #endif
@@ -253,7 +275,7 @@ static bool gcm_key_setup(CvmcryptGcm* g, u8 const* key, usize keylen) {
      * silently wrong tag is not an option.
      * Tracked in t61. */
     g->impl = CVMCRYPT_GCM_IMPL_PMULL;
-    g->asm_ok = 0;
+    g->asm_ok = gcm_x86_has_asm();
     gcm_asm_setup(g, keylen);
 #else
     g->impl = CVMCRYPT_GCM_IMPL_SCALAR;
