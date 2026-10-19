@@ -598,13 +598,31 @@ int cvm_tls_decode_client_hello(CvmTlsClientHello* ch, u8 const* src, u8 const* 
     }
     if (tls_decode16(&len, &p, end) != 0)
         return TLS_ERROR_DECODE;
-    for (usize i = 0; i < len / 2 && i < 16; i++) {
-        if (tls_decode16(&ch->cipher_suites[i], &p, end) != 0)
-            return TLS_ERROR_DECODE;
-        ch->num_cipher_suites++;
+    /*
+     * Consume the WHOLE list even when it is longer than the array. Stopping
+     * at CVMS_MAX makes every following field parse one cipher suite late:
+     * the compression length reads a suite byte, the extension block reads
+     * garbage, and the handshake dies with a decode error. OpenSSL offers
+     * around ten suites and never hit it; LibreSSL offers more and always
+     * did. The wire is the authority, the array is just storage.
+     */
+    {
+        usize const count = len / 2;
+        for (usize i = 0; i < count; i++) {
+            u16 id;
+            if (tls_decode16(&id, &p, end) != 0)
+                return TLS_ERROR_DECODE;
+            if (i < 16) {
+                ch->cipher_suites[i] = id;
+                ch->num_cipher_suites++;
+            }
+        }
+        if (len & 1) {
+            u8 ignored;
+            if (tls_decode8(&ignored, &p, end) != 0)
+                return TLS_ERROR_DECODE;
+        }
     }
-    if (len & 1)
-        p++; /* skip odd byte */
     if (tls_decode8(&comp_len, &p, end) != 0)
         return TLS_ERROR_DECODE;
     p += comp_len;
