@@ -56,6 +56,42 @@ void cvm_tls_free(CvmTls* tls) {
 }
 
 /* ------------------------------------------------------------------ */
+/* helper: emit a handshake message                                    */
+/* ------------------------------------------------------------------ */
+
+/*
+ * In QUIC mode a handshake message is not a record: it is a plaintext blob
+ * tagged with the encryption level it belongs to, and the caller wraps it in
+ * CRYPTO frames. epoch_offsets[k] is the END offset of epoch k-1, so the
+ * range for epoch e is [offsets[e], offsets[e+1]).
+ */
+static void quic_note_emit(CvmTls* tls, CvmTlsBuf* buf, usize start) {
+    if (!tls->quic || tls->epoch_offsets == NULL)
+        return;
+    /* Close every level below this one so the ranges are contiguous. */
+    for (usize e = 0; e < tls->write_epoch; e++) {
+        if (tls->epoch_offsets[e + 1] == 0)
+            tls->epoch_offsets[e + 1] = start;
+    }
+    tls->epoch_offsets[tls->write_epoch + 1] = buf->off;
+}
+
+static int emit_handshake(CvmTls* tls, CvmTlsBuf* sendbuf, u8 const* msg, usize len) {
+    usize const start = sendbuf->off;
+    int ret;
+
+    if (tls->quic) {
+        if ((ret = cvm_tls_buf_pushv(sendbuf, msg, len)) != 0)
+            return ret;
+        quic_note_emit(tls, sendbuf, start);
+        return 0;
+    }
+
+    return cvm_tls_push_encrypted_records(sendbuf, TLS_CONTENT_TYPE_HANDSHAKE, msg, len,
+                                          &tls->enc);
+}
+
+/* ------------------------------------------------------------------ */
 /* helper: derive traffic keys and set up protection                   */
 /* ------------------------------------------------------------------ */
 
@@ -137,36 +173,47 @@ static int client_send_client_hello(CvmTls* tls, CvmTlsBuf* sendbuf) {
         tls->keyex_pubkey_len = sizeof(tls->keyex_pubkey);
     memcpy(tls->keyex_pubkey, tls->keyex_ctx->pubkey, tls->keyex_pubkey_len);
 
-    /* Write record header. */
+    /* Record header, unless this is QUIC: there the ClientHello is a
+     * plaintext handshake message carried in Initial CRYPTO frames. */
     usize rec_start = sendbuf->off;
-    if ((ret = cvm_tls_buf_push(sendbuf, TLS_CONTENT_TYPE_HANDSHAKE)) != 0)
-        return ret;
-    if ((ret = cvm_tls_buf_push(sendbuf, 3)) != 0)
-        return ret;
-    if ((ret = cvm_tls_buf_push(sendbuf, 3)) != 0)
-        return ret;
-    if ((ret = cvm_tls_buf_push(sendbuf, 0)) != 0)
-        return ret;
-    if ((ret = cvm_tls_buf_push(sendbuf, 0)) != 0)
-        return ret;
+    if (!tls->quic) {
+        if ((ret = cvm_tls_buf_push(sendbuf, TLS_CONTENT_TYPE_HANDSHAKE)) != 0)
+            return ret;
+        if ((ret = cvm_tls_buf_push(sendbuf, 3)) != 0)
+            return ret;
+        if ((ret = cvm_tls_buf_push(sendbuf, 3)) != 0)
+            return ret;
+        if ((ret = cvm_tls_buf_push(sendbuf, 0)) != 0)
+            return ret;
+        if ((ret = cvm_tls_buf_push(sendbuf, 0)) != 0)
+            return ret;
+    }
 
     /* Encode ClientHello. */
     ret = cvm_tls_encode_client_hello(
         sendbuf, tls->ctx->cipher_suites, tls->client_random,
         (CvmTlsVec){tls->legacy_session_id, 32}, tls->server_name, keyex,
-        (CvmTlsVec){tls->keyex_pubkey, tls->keyex_pubkey_len}, NULL, 0);
+        (CvmTlsVec){tls->keyex_pubkey, tls->keyex_pubkey_len}, NULL, 0,
+        tls->quic ? (CvmTlsVec){tls->local_quic_params, tls->local_quic_params_len}
+                  : (CvmTlsVec){NULL, 0});
     if (ret != 0)
         return ret;
 
-    /* Fix record length. */
-    usize body_len = sendbuf->off - rec_start - 5;
-    sendbuf->base[rec_start + 3] = (u8)(body_len >> 8);
-    sendbuf->base[rec_start + 4] = (u8)body_len;
+    usize body_start = rec_start + (tls->quic ? 0 : 5);
+    usize body_len = sendbuf->off - body_start;
+
+    if (tls->quic) {
+        tls->write_epoch = 0;
+        quic_note_emit(tls, sendbuf, rec_start);
+    } else {
+        sendbuf->base[rec_start + 3] = (u8)(body_len >> 8);
+        sendbuf->base[rec_start + 4] = (u8)body_len;
+    }
 
     /* Save the CH handshake message (not the record header) for transcript replay. */
     cvm_tls_buf_dispose(&tls->sendbuf_early);
     cvm_tls_buf_init(&tls->sendbuf_early, NULL, 0);
-    if ((ret = cvm_tls_buf_pushv(&tls->sendbuf_early, sendbuf->base + rec_start + 5,
+    if ((ret = cvm_tls_buf_pushv(&tls->sendbuf_early, sendbuf->base + body_start,
                                  body_len)) != 0)
         return ret;
 
@@ -327,9 +374,22 @@ static int client_handle_message(CvmTls* tls, CvmTlsBuf* sendbuf, CvmTlsVec mess
 
     case TLS_STATE_CLIENT_EXPECT_ENCRYPTED_EXTENSIONS:
         if (type == TLS_HANDSHAKE_TYPE_ENCRYPTED_EXTENSIONS) {
-            /* Accept — we don't negotiate ALPN for now. */
-            tls->state = TLS_STATE_CLIENT_EXPECT_CERTIFICATE_REQUEST_OR_CERTIFICATE;
-            ret = 0;
+            /* Pull out the QUIC transport parameters if present. ALPN is not
+             * negotiated by this client. */
+            usize plen = 0;
+            ret = cvm_tls_decode_encrypted_extensions(
+                (CvmTlsVec){message.base + 4, message.len - 4}, tls->remote_quic_params,
+                sizeof(tls->remote_quic_params), &plen);
+            if (ret == 0) {
+                tls->remote_quic_params_len = plen;
+                if (tls->quic && plen == 0) {
+                    /* A QUIC peer must send them; their absence is fatal. */
+                    ret = TLS_ALERT_MISSING_EXTENSION;
+                } else {
+                    tls->state =
+                        TLS_STATE_CLIENT_EXPECT_CERTIFICATE_REQUEST_OR_CERTIFICATE;
+                }
+            }
         } else {
             ret = TLS_ALERT_UNEXPECTED_MESSAGE;
         }
@@ -426,9 +486,10 @@ static int client_handle_message(CvmTls* tls, CvmTlsBuf* sendbuf, CvmTlsVec mess
                         ret = cvm_tls_encode_finished(&fin_buf,
                                                       (CvmTlsVec){verify_data, dlen});
                         if (ret == 0) {
-                            ret = cvm_tls_push_encrypted_records(
-                                sendbuf, TLS_CONTENT_TYPE_HANDSHAKE, fin_buf.base,
-                                fin_buf.off, &tls->enc);
+                            /* Finished belongs to the Handshake level (2). */
+                            tls->write_epoch = 2;
+                            ret =
+                                emit_handshake(tls, sendbuf, fin_buf.base, fin_buf.off);
                         }
                         if (ret == 0) {
                             cvm_tls_ks_update_hash(&tls->ks, fin_buf.base, fin_buf.off);
@@ -766,15 +827,110 @@ u32 cvm_tls_get_read_epoch(CvmTls const* tls) {
     return tls->read_epoch;
 }
 
+int cvm_tls_quic_set_local_transport_params(CvmTls* tls, u8 const* data, usize len) {
+    if (tls == NULL || (data == NULL && len > 0))
+        return TLS_ALERT_INTERNAL_ERROR;
+    if (len > sizeof(tls->local_quic_params))
+        return TLS_ALERT_ILLEGAL_PARAMETER;
+
+    if (len > 0)
+        memcpy(tls->local_quic_params, data, len);
+    tls->local_quic_params_len = len;
+    return 0;
+}
+
+CvmTlsVec cvm_tls_quic_remote_transport_params(CvmTls const* tls) {
+    if (tls == NULL)
+        return (CvmTlsVec){NULL, 0};
+    return (CvmTlsVec){tls->remote_quic_params, tls->remote_quic_params_len};
+}
+
+bool cvm_tls_is_quic(CvmTls const* tls) {
+    return tls != NULL && tls->quic;
+}
+
 int cvm_tls_handle_message(CvmTls* tls, CvmTlsBuf* sendbuf, usize epoch_offsets[5],
                            usize in_epoch, void const* input, usize inlen,
                            CvmTlsHandshakeProps* props) {
-    (void)tls;
-    (void)sendbuf;
-    (void)epoch_offsets;
-    (void)in_epoch;
-    (void)input;
-    (void)inlen;
+    int ret;
+
     (void)props;
-    return TLS_ERROR_NOT_AVAILABLE;
+
+    if (tls == NULL || sendbuf == NULL || epoch_offsets == NULL)
+        return TLS_ALERT_INTERNAL_ERROR;
+
+    /* QUIC mode: no records, ever. Set on the first call so a session cannot
+     * be half-record, half-not. */
+    tls->quic = true;
+    tls->epoch_offsets = epoch_offsets;
+    for (usize i = 0; i < 5; i++) {
+        epoch_offsets[i] = 0;
+    }
+
+    /*
+     * QUIC hands us CRYPTO data for one encryption level at a time and the
+     * level must match what the key schedule expects, or messages would be
+     * fed in the wrong order.
+     */
+    if (in_epoch != tls->read_epoch)
+        return TLS_ALERT_UNEXPECTED_MESSAGE;
+
+    /* ClientHello goes out on the first call, at the Initial level (0). */
+    if (tls->state == TLS_STATE_CLIENT_HANDSHAKE_START) {
+        tls->write_epoch = 0;
+        ret = client_send_client_hello(tls, sendbuf);
+        if (ret != 0)
+            return ret;
+        if (input == NULL || inlen == 0)
+            return TLS_ERROR_IN_PROGRESS;
+    }
+
+    /*
+     * Reassemble: a CRYPTO frame may end in the middle of a handshake
+     * message. Whatever is left over is kept in recvbuf_msg for the next
+     * call.
+     */
+    u8 const* src = input;
+    usize remaining = inlen;
+
+    if (tls->recvbuf_msg.off > 0) {
+        if ((ret = cvm_tls_buf_pushv(&tls->recvbuf_msg, input, inlen)) != 0)
+            return ret;
+        src = tls->recvbuf_msg.base;
+        remaining = tls->recvbuf_msg.off;
+    }
+
+    while (remaining >= 4) {
+        usize const mlen = ((usize)src[1] << 16) | ((usize)src[2] << 8) | (usize)src[3];
+        if (remaining < 4 + mlen)
+            break; /* incomplete message */
+
+        /* Anything the state machine emits while handling this message
+         * belongs to the level it arrived on. */
+        tls->write_epoch = in_epoch;
+
+        CvmTlsVec msg = {(u8*)src, 4 + mlen};
+        ret = client_handle_message(tls, sendbuf, msg);
+        if (ret != 0) {
+            tls->recvbuf_msg.off = 0;
+            return ret;
+        }
+
+        src += 4 + mlen;
+        remaining -= 4 + mlen;
+    }
+
+    /* Keep the tail for the next call. */
+    if (src != tls->recvbuf_msg.base) {
+        tls->recvbuf_msg.off = 0;
+        if (remaining > 0) {
+            if ((ret = cvm_tls_buf_pushv(&tls->recvbuf_msg, src, remaining)) != 0)
+                return ret;
+        }
+    } else {
+        /* Nothing consumed: keep the buffer as it is. */
+        tls->recvbuf_msg.off = remaining;
+    }
+
+    return tls->handshake_complete ? 0 : TLS_ERROR_IN_PROGRESS;
 }

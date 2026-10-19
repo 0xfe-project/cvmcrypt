@@ -79,6 +79,10 @@ typedef struct CvmTlsTrafficProt {
     char const* label;
 } CvmTlsTrafficProt;
 
+/* QUIC transport parameters are a few hundred bytes at most; ngtcp2's own
+ * encoder produces well under this. */
+#define TLS_MAX_QUIC_PARAMS_SIZE 512
+
 CVM_INLINE void tls_build_aad(u8 aad[5], usize reclen) {
     aad[0] = TLS_CONTENT_TYPE_APPDATA;
     aad[1] = 3;

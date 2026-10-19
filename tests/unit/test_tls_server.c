@@ -171,7 +171,7 @@ static void build_client_hello(CvmTlsBuf* buf) {
     /* encode_client_hello already writes the handshake header. */
     cvm_tls_encode_client_hello(buf, SUITES, random, (CvmTlsVec){session_id, 32},
                                 "example.com", &DUMMY_KEYEX, (CvmTlsVec){random, 32},
-                                NULL, 0);
+                                NULL, 0, (CvmTlsVec){NULL, 0});
 }
 
 /* ------------------------------------------------------------------ */

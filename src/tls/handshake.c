@@ -113,7 +113,8 @@ int cvm_tls_encode_client_hello(CvmTlsBuf* buf,
                                 u8 const random[32], CvmTlsVec legacy_session_id,
                                 char const* server_name, CvmTlsKeyexAlgo const* keyex,
                                 CvmTlsVec keyex_pubkey, CvmTlsVec* psk_identity,
-                                u32 psk_obfuscated_ticket_age) {
+                                u32 psk_obfuscated_ticket_age,
+                                CvmTlsVec quic_transport_params) {
     int ret;
     usize hdr_start, ext_start;
     (void)psk_identity;
@@ -302,6 +303,23 @@ int cvm_tls_encode_client_hello(CvmTlsBuf* buf,
         if ((ret = cvm_tls_buf_push(buf, TLS_PSK_KE_MODE_PSK_DHE_KEY_EXCHANGE)) != 0)
             return ret;
         fix_block16(buf, pk_start);
+    }
+
+    /* quic_transport_parameters — extension 57 (0x39). A QUIC peer aborts the
+     * handshake when it is missing, so it must be here in QUIC mode and absent
+     * otherwise. */
+    if (quic_transport_params.base != NULL && quic_transport_params.len > 0) {
+        usize qp_start;
+        if ((ret = cvm_tls_buf_push(buf, 0)) != 0)
+            return ret;
+        if ((ret = cvm_tls_buf_push(buf, 0x39)) != 0)
+            return ret;
+        if ((ret = push_block16(buf, &qp_start)) != 0)
+            return ret;
+        if ((ret = cvm_tls_buf_pushv(buf, quic_transport_params.base,
+                                     quic_transport_params.len)) != 0)
+            return ret;
+        fix_block16(buf, qp_start);
     }
 
     fix_block16(buf, ext_start);
@@ -805,5 +823,52 @@ int cvm_tls_build_cert_verify_data(u8* output, usize output_cap, usize* out_len,
     memcpy(output + 64 + ctx_len + 1, transcript_hash, hash_len);
 
     *out_len = total;
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* EncryptedExtensions decoding                                         */
+/* ------------------------------------------------------------------ */
+
+/*
+ * Walk the extension block and copy out the QUIC transport parameters
+ * (0x39). Everything else is ignored, including ALPN: this client does not
+ * negotiate a protocol today.
+ *
+ * Returns 0 even when 0x39 is absent; QUIC mode checks for that itself,
+ * because "absent" is only an error when the caller is QUIC.
+ */
+int cvm_tls_decode_encrypted_extensions(CvmTlsVec body, u8* quic_params,
+                                        usize params_cap, usize* params_len) {
+    if (params_len != NULL)
+        *params_len = 0;
+    if (body.len < 2)
+        return TLS_ALERT_DECODE_ERROR;
+
+    usize ext_total = ((usize)body.base[0] << 8) | body.base[1];
+    if (ext_total + 2 > body.len)
+        return TLS_ALERT_DECODE_ERROR;
+
+    u8 const* p = body.base + 2;
+    u8 const* end = p + ext_total;
+
+    while (p + 4 <= end) {
+        u16 type = (u16)(((u16)p[0] << 8) | p[1]);
+        usize len = ((usize)p[2] << 8) | p[3];
+        p += 4;
+        if (p + len > end)
+            return TLS_ALERT_DECODE_ERROR;
+
+        if (type == 0x0039) {
+            if (params_len == NULL)
+                return TLS_ALERT_DECODE_ERROR;
+            if (len > params_cap)
+                return TLS_ALERT_ILLEGAL_PARAMETER;
+            memcpy(quic_params, p, len);
+            *params_len = len;
+        }
+        p += len;
+    }
+
     return 0;
 }

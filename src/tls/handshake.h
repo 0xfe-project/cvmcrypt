@@ -87,13 +87,17 @@ typedef struct CvmTlsNewSessionTicket {
 /* ------------------------------------------------------------------ */
 
 /* Build a ClientHello. Returns the message (including 4-byte header) in buf. */
-int cvm_tls_encode_client_hello(CvmTlsBuf* buf,
-                                CvmTlsCipherSuite const* const* cipher_suites,
-                                u8 const random[32], CvmTlsVec legacy_session_id,
-                                char const* server_name, CvmTlsKeyexAlgo const* keyex,
-                                CvmTlsVec keyex_pubkey,
-                                CvmTlsVec* psk_identity, /* NULL if no PSK */
-                                u32 psk_obfuscated_ticket_age);
+int cvm_tls_encode_client_hello(
+    CvmTlsBuf* buf, CvmTlsCipherSuite const* const* cipher_suites, u8 const random[32],
+    CvmTlsVec legacy_session_id, char const* server_name, CvmTlsKeyexAlgo const* keyex,
+    CvmTlsVec keyex_pubkey, CvmTlsVec* psk_identity, /* NULL if no PSK */
+    u32 psk_obfuscated_ticket_age,
+    CvmTlsVec quic_transport_params); /* empty if not QUIC */
+
+/* Read the peer's QUIC transport parameters (extension 0x39) out of an
+ * EncryptedExtensions body. *params_len is 0 when the extension is absent. */
+int cvm_tls_decode_encrypted_extensions(CvmTlsVec body, u8* quic_params,
+                                        usize params_cap, usize* params_len);
 
 /* Build a ServerHello. */
 int cvm_tls_encode_server_hello(CvmTlsBuf* buf, CvmTlsCipherSuite const* suite,

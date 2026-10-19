@@ -430,6 +430,23 @@ int cvm_tls_receive(CvmTls* tls, CvmTlsBuf* decryptbuf, void const* input,
 /* Send an alert and close. */
 int cvm_tls_send_alert(CvmTls* tls, CvmTlsBuf* sendbuf, u8 level, u8 description);
 
+/*
+ * QUIC transport mode.
+ *
+ * The local transport parameters must be set before the handshake reaches
+ * ClientHello; ngtcp2 encodes them and hands them over through
+ * ngtcp2_crypto_set_local_transport_params(). The peer's arrive in
+ * EncryptedExtensions (extension 0x39) and are readable afterwards with
+ * cvm_tls_quic_remote_transport_params().
+ *
+ * Both are opaque blobs to this layer: the contents are ngtcp2's business.
+ */
+int cvm_tls_quic_set_local_transport_params(CvmTls* tls, u8 const* data, usize len);
+CvmTlsVec cvm_tls_quic_remote_transport_params(CvmTls const* tls);
+
+/* True once the session has run in QUIC mode (no record layer). */
+bool cvm_tls_is_quic(CvmTls const* tls);
+
 /* QUIC transport mode: get/set handshake messages without record layer. */
 int cvm_tls_handle_message(CvmTls* tls, CvmTlsBuf* sendbuf, usize epoch_offsets[5],
                            usize in_epoch, void const* input, usize inlen,

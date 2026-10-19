@@ -77,7 +77,7 @@ TEST client_hello_roundtrip(void) {
 
     int ret = cvm_tls_encode_client_hello(
         &buf, SUITES, random, (CvmTlsVec){session_id, 32}, "example.com", &DUMMY_KEYEX,
-        (CvmTlsVec){pubkey, 32}, NULL, 0);
+        (CvmTlsVec){pubkey, 32}, NULL, 0, (CvmTlsVec){NULL, 0});
     ASSERT_EQ(0, ret);
     ASSERT(buf.off > 100); /* should be substantial */
 

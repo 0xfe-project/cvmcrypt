@@ -46,6 +46,24 @@ struct CvmTls {
     /* Highest level with receive keys installed; see cvm_tls_get_read_epoch. */
     u32 read_epoch;
 
+    /* QUIC transport mode. `quic` turns off the record layer entirely:
+     * handshake messages are emitted as plaintext and tagged with the
+     * encryption level they belong to. */
+    bool quic;
+    /* epoch_offsets[5] of the current cvm_tls_handle_message() call, or NULL.
+     * Entry i is the END offset of the bytes belonging to epoch i-1, so the
+     * range for epoch i is [offsets[i], offsets[i+1]). */
+    usize* epoch_offsets;
+    /* Encryption level the next emitted handshake message belongs to. */
+    usize write_epoch;
+    /* Local transport parameters. Copied, not referenced: ngtcp2 hands them
+     * over in a stack buffer that is gone by the time ClientHello is built. */
+    u8 local_quic_params[TLS_MAX_QUIC_PARAMS_SIZE];
+    usize local_quic_params_len;
+    /* Peer's transport parameters, copied out of EncryptedExtensions. */
+    u8 remote_quic_params[TLS_MAX_QUIC_PARAMS_SIZE];
+    usize remote_quic_params_len;
+
     /* Received server certificate (DER). */
     CvmTlsCertEntry certs[4];
     usize num_certs;
