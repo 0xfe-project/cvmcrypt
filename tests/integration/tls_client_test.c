@@ -240,17 +240,57 @@ int main(int argc, char** argv) {
             return 1;
         }
 
-        /* Read response. */
-        u8 resp[16384];
-        ssize_t n = recv(fd, resp, sizeof(resp), 0);
-        printf("[6] HTTP response: %zd bytes\n", n);
-        if (n > 0) {
-            /* Show first 200 bytes. */
-            printf("    First bytes: ");
-            for (int i = 0; i < 200 && i < n; i++)
-                printf("%c", resp[i] >= 32 && resp[i] < 127 ? resp[i] : '.');
-            printf("\n");
+        /* Read and DECRYPT the response. This is cvm_tls_receive's first
+         * real exercise: before this it returned TLS_ERROR_NOT_AVAILABLE, so
+         * the test could send a request but never read the answer. */
+        CvmTlsBuf plain;
+        cvm_tls_buf_init(&plain, NULL, 0);
+
+        for (int round = 0; round < 8 && plain.off == 0; round++) {
+            u8 resp[16384];
+            ssize_t n = recv(fd, resp, sizeof(resp), 0);
+            printf("[6.%d] received %zd encrypted bytes\n", round, n);
+            if (n <= 0)
+                break;
+
+            usize consumed = (usize)n;
+            int rret = cvm_tls_receive(tls, &plain, resp, &consumed);
+            printf("[6.%d] consumed %zu, plaintext so far %zu, ret=%d\n", round,
+                   consumed, plain.off, rret);
+            if (rret == (TLS_ERROR_CLASS_ALERT | TLS_ALERT_CLOSE_NOTIFY)) {
+                printf("    (server sent close_notify)\n");
+                break;
+            }
+            if (rret != 0 && rret != TLS_ERROR_IN_PROGRESS) {
+                printf("[!] cvm_tls_receive failed: %d\n", rret);
+                break;
+            }
         }
+
+        if (plain.off > 0) {
+            printf("[6] plaintext response: %zu bytes\n", plain.off);
+            printf("    First line: ");
+            for (usize i = 0; i < plain.off && plain.base[i] != '\r'; i++)
+                printf("%c", plain.base[i]);
+            printf("\n");
+            if (plain.off < 12 || memcmp(plain.base, "HTTP/1.", 7) != 0) {
+                fprintf(stderr, "FAIL: decrypted response does not start with HTTP/\n");
+                cvm_tls_buf_dispose(&plain);
+                cvm_tls_buf_dispose(&sendbuf);
+                cvm_tls_free(tls);
+                close(fd);
+                return 1;
+            }
+            printf("decrypted HTTP response: OK\n");
+        } else {
+            fprintf(stderr, "FAIL: no plaintext decrypted\n");
+            cvm_tls_buf_dispose(&plain);
+            cvm_tls_buf_dispose(&sendbuf);
+            cvm_tls_free(tls);
+            close(fd);
+            return 1;
+        }
+        cvm_tls_buf_dispose(&plain);
     } else {
         printf("[!] Handshake did not complete (state=%d)\n", tls->state);
     }

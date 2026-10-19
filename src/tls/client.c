@@ -639,20 +639,114 @@ int cvm_tls_send(CvmTls* tls, CvmTlsBuf* sendbuf, void const* input, usize inlen
 
 int cvm_tls_receive(CvmTls* tls, CvmTlsBuf* decryptbuf, void const* input,
                     usize* inlen) {
-    /* TODO: decrypt app data records. */
-    (void)tls;
-    (void)decryptbuf;
-    (void)input;
-    *inlen = 0;
-    return TLS_ERROR_NOT_AVAILABLE;
+    u8 const* src = input;
+    usize remaining = *inlen;
+    int ret = 0;
+
+    if (!tls->handshake_complete)
+        return TLS_ALERT_UNEXPECTED_MESSAGE;
+
+    while (remaining > 0) {
+        CvmTlsRecord rec;
+        usize consumed = remaining;
+
+        ret = cvm_tls_parse_record(&rec, src, &consumed, &tls->recvbuf_rec);
+        if (ret == TLS_ERROR_IN_PROGRESS) {
+            /* Partial record: keep it and wait for more bytes. */
+            ret = 0;
+            break;
+        }
+        if (ret != 0)
+            break;
+
+        src += consumed;
+        remaining -= consumed;
+
+        if (rec.type == TLS_CONTENT_TYPE_CHANGE_CIPHER_SPEC)
+            continue;
+
+        if (tls->dec.aead != NULL && rec.type == TLS_CONTENT_TYPE_APPDATA) {
+            u8* plain = rt_mem_alloc(rec.length);
+            if (plain == NULL) {
+                ret = TLS_ERROR_NO_MEMORY;
+                break;
+            }
+
+            usize ptlen = 0;
+            u8 content_type = 0;
+            ret = cvm_tls_aead_decrypt(&tls->dec, plain, &ptlen, &content_type,
+                                       rec.fragment, rec.length);
+            if (ret == 0) {
+                switch (content_type) {
+                case TLS_CONTENT_TYPE_APPDATA:
+                    ret = cvm_tls_buf_pushv(decryptbuf, plain, ptlen);
+                    break;
+                case TLS_CONTENT_TYPE_ALERT:
+                    /*
+                     * An alert inside an encrypted record. close_notify is a
+                     * clean end of stream; anything else is fatal. Both are
+                     * reported the same way — the caller decides by checking
+                     * the low byte against TLS_ALERT_CLOSE_NOTIFY.
+                     */
+                    ret = ptlen >= 2 ? (TLS_ERROR_CLASS_ALERT | plain[1])
+                                     : TLS_ALERT_DECODE_ERROR;
+                    break;
+                default:
+                    /*
+                     * Post-handshake handshake messages (NewSessionTicket,
+                     * KeyUpdate) are accepted and ignored. KeyUpdate is not
+                     * acted on yet: a peer that actually asks for a key
+                     * update would desynchronise, and that is recorded as a
+                     * gap rather than silently half-implemented.
+                     */
+                    break;
+                }
+            }
+
+            memset(plain, 0, rec.length);
+            rt_mem_free(plain);
+            if (ret != 0)
+                break;
+        } else {
+            /* A plaintext record after the handshake: alerts only. */
+            if (rec.type == TLS_CONTENT_TYPE_ALERT && rec.length >= 2) {
+                ret = TLS_ERROR_CLASS_ALERT | rec.fragment[1];
+                break;
+            }
+        }
+    }
+
+    *inlen -= remaining;
+    return ret;
 }
 
 int cvm_tls_send_alert(CvmTls* tls, CvmTlsBuf* sendbuf, u8 level, u8 description) {
-    (void)tls;
-    (void)sendbuf;
-    (void)level;
-    (void)description;
-    return TLS_ERROR_NOT_AVAILABLE;
+    u8 alert[2] = {level, description};
+
+    if (sendbuf == NULL)
+        return TLS_ALERT_INTERNAL_ERROR;
+
+    /*
+     * Alerts are ordinary records once keys exist. Before the handshake has
+     * produced any, they go out in the clear, which is what a client that
+     * rejects a ServerHello must do.
+     */
+    if (tls->enc.aead != NULL) {
+        return cvm_tls_push_encrypted_records(sendbuf, TLS_CONTENT_TYPE_ALERT, alert,
+                                              sizeof(alert), &tls->enc);
+    }
+
+    if (cvm_tls_buf_push(sendbuf, TLS_CONTENT_TYPE_ALERT) != 0)
+        return TLS_ERROR_NO_MEMORY;
+    if (cvm_tls_buf_push(sendbuf, 3) != 0)
+        return TLS_ERROR_NO_MEMORY;
+    if (cvm_tls_buf_push(sendbuf, 3) != 0)
+        return TLS_ERROR_NO_MEMORY;
+    if (cvm_tls_buf_push(sendbuf, 0) != 0)
+        return TLS_ERROR_NO_MEMORY;
+    if (cvm_tls_buf_push(sendbuf, (u8)sizeof(alert)) != 0)
+        return TLS_ERROR_NO_MEMORY;
+    return cvm_tls_buf_pushv(sendbuf, alert, sizeof(alert));
 }
 
 bool cvm_tls_is_server(CvmTls const* tls) {
