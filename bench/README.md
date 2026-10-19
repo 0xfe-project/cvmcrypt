@@ -16,7 +16,14 @@
 | X25519 public key (comb) | **5.9 µs** | ~23.5 | **6.28** | **beats ✅** | **beats ✅** |
 | AES-128-GCM | **9,305–9,378 MB/s** | **10,185** | **9,352** | 1.09× gap | **beats ring** |
 | SHA-256 | **~3,272 MB/s** | **3,434** | **3,419** | ~parity | ~parity |
+| AES-GCM decrypt | **8,400 MB/s** | — | — | — | — |
+| TLS record encrypt (incl. AAD+tag) | **9,259 MB/s** | — | — | — | — |
 | TLS handshake | **21.3 µs** | — | — | complete ✅ | complete ✅ |
+
+> Platforms without hardware AES-GCM assembly (x86 without AES-NI,
+> non-arm64/x86_64 targets) fall back to the portable path, which is
+> currently **10 MB/s** — the portable GHASH is bit-by-bit scalar. That is
+> a known limitation, tracked separately.
 
 ## Optimization Journey
 
