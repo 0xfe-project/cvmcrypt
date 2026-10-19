@@ -120,7 +120,14 @@ extern "C" {
 /* error codes                                                          */
 /* ------------------------------------------------------------------ */
 
-#define TLS_ERROR_CLASS_ALERT 0x0000
+/*
+ * Alert class must not be zero: `TLS_ERROR_CLASS_ALERT | TLS_ALERT_CLOSE_NOTIFY`
+ * is the close_notify return value, and TLS_ALERT_CLOSE_NOTIFY is 0. With a
+ * zero class that value collides with "success", so every caller comparing
+ * against it sees close_notify where there was none — which is exactly what
+ * made the sockets library hang up on the first successful read.
+ */
+#define TLS_ERROR_CLASS_ALERT 0x30000
 #define TLS_ERROR_CLASS_EXTERNAL 0x10000
 #define TLS_ERROR_CLASS_INTERNAL 0x20000
 
