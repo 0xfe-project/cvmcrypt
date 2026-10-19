@@ -456,17 +456,56 @@ static bool gcm_open_body(CvmcryptGcm* g, u8 const* aad, usize aadlen, u8 const*
         g->buflen = 0;
     }
 
-    /* Absorb the ciphertext into GHASH (before decrypting). */
-    if (ct && ctlen > 0) {
-        ghash_update(g, ct, ctlen, &g->ptlen);
+    /* Bulk: GHASH the ciphertext and decrypt in one pass. The kernel
+     * writes plaintext before the tag is verified, so a failure zeroes it
+     * (below) — same contract as before, just a different order. */
+    u8 j0[16];
+    memcpy(j0, g->counter, 16);
+
+    int bulk_done = 0;
+#if defined(__aarch64__) || defined(__x86_64__)
+    if (g->impl == CVMCRYPT_GCM_IMPL_PMULL && g->asm_ok) {
+        usize nblk = ctlen & ~(usize)15;
+        u8 ivec[16];
+        memcpy(ivec, j0, 16);
+        increment_counter(ivec); /* kernels use the counter as-is */
+#if defined(__x86_64__)
+        /* The x86 kernel bails out below 288 bytes (18 blocks). */
+        if (nblk >= 288) {
+            usize done =
+                aesni_gcm_decrypt(ct, pt, nblk, g->aes_rk, ivec, g->htable, (u64*)g->X);
+            g->ptlen += (u64)done * 8;
+            nblk = done;
+        } else {
+            nblk = 0;
+        }
+#else
+        if (nblk > 0) {
+            aes_gcm_dec_kernel(ct, (u64)nblk * 8, pt, g->X, ivec, g->aes_rk, g->htable);
+            g->ptlen += (u64)nblk * 8;
+        }
+#endif
+        /* Both kernels leave the advanced counter in ivec; the tail must
+         * continue from there, not from ICB again. */
+        memcpy(g->counter, ivec, 16);
+        if (ctlen > nblk) {
+            gcm_crypt(g, ct + nblk, ctlen - nblk, pt + nblk);
+            ghash_update(g, ct + nblk, ctlen - nblk, &g->ptlen);
+        }
+        bulk_done = 1;
+    }
+#endif
+    if (!bulk_done) {
+        /* Absorb the ciphertext into GHASH (before decrypting). */
+        if (ct && ctlen > 0) {
+            ghash_update(g, ct, ctlen, &g->ptlen);
+        }
     }
 
     /* Finalise GHASH. */
     ghash_flush(g, g->aadlen, g->ptlen);
 
     /* Compute the expected tag. */
-    u8 j0[16];
-    memcpy(j0, g->counter, 16);
     u8 ekJ0[16];
     cvmcrypt_aes_encrypt_block(&g->aes, j0, ekJ0);
     u8 expected[16];
@@ -482,13 +521,14 @@ static bool gcm_open_body(CvmcryptGcm* g, u8 const* aad, usize aadlen, u8 const*
         return false;
     }
 
-    /* Decrypt (same GCTR as encrypt). */
-    u8 ctr[16];
-    memcpy(ctr, g->counter, 16);
-    increment_counter(ctr);
-
-    memcpy(g->counter, ctr, 16);
-    gcm_crypt(g, ct, ctlen, pt);
+    if (!bulk_done) {
+        /* Decrypt (same GCTR as encrypt). */
+        u8 ctr[16];
+        memcpy(ctr, g->counter, 16);
+        increment_counter(ctr);
+        memcpy(g->counter, ctr, 16);
+        gcm_crypt(g, ct, ctlen, pt);
+    }
     return true;
 }
 
