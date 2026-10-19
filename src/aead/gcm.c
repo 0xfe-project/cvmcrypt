@@ -17,6 +17,17 @@
 #include "base/mem.h"
 #include "base/secure.h"
 
+#if defined(__aarch64__)
+/* Adopted from BoringSSL, vendored via ring 0.17.14 pregenerated/.
+ * Sources: src/aead/asm/{aes_gcm,ghash}_arm64_{apple,elf}.S */
+extern void gcm_init_clmul(u8 htable[256], u8 const h[16]);
+extern void gcm_gmult_clmul(u8 xi[16], u8 const htable[256]);
+extern void aes_gcm_enc_kernel(u8 const* in, u64 in_len, u8* out, u8* xi, u8* ivec,
+                               u32 const* key, u8 const* htable);
+extern void aes_gcm_dec_kernel(u8 const* in, u64 in_len, u8* out, u8* xi, u8* ivec,
+                               u32 const* key, u8 const* htable);
+#endif
+
 /* ------------------------------------------------------------------ */
 /* GF(2^128) multiplication                                             */
 /* ------------------------------------------------------------------ */
@@ -236,9 +247,19 @@ __attribute__((target("crypto"))) static void ghash_8blocks_refl(CvmcryptGcm* g,
 /* Single-block GHASH multiply (slow path for partial blocks).
  * On aarch64, uses the reflected-domain single-block path;
  * elsewhere, scalar bit-by-bit. */
-static void gf128_mul(u8 const* a, u8 const* b, u8* out, u8 impl) {
+static void gf128_mul(CvmcryptGcm* g, u8 const* a, u8 const* b, u8* out) {
+#if defined(__aarch64__)
+    if (g->impl == CVMCRYPT_GCM_IMPL_PMULL) {
+        (void)b; /* GCM only ever multiplies by g->H */
+        memcpy(out, a, 16);
+        gcm_gmult_clmul(out, g->htable);
+        return;
+    }
+#else
+    (void)g;
+    (void)b;
+#endif
     gf128_mul_scalar(a, b, out);
-    (void)impl;
 }
 
 /* ------------------------------------------------------------------ */
@@ -288,7 +309,7 @@ static void ghash_update(CvmcryptGcm* g, u8 const* data, usize len, u64* total_b
             for (usize i = 0; i < 16; i++) {
                 g->X[i] ^= g->buf[i];
             }
-            gf128_mul(g->X, g->H, g->X, g->impl);
+            gf128_mul(g, g->X, g->H, g->X);
             /* Sync reflected accumulator for the fast path. */
 #if defined(__aarch64__)
             if (g->impl == CVMCRYPT_GCM_IMPL_PMULL) {
@@ -307,7 +328,7 @@ static void ghash_flush(CvmcryptGcm* g, u64 aad_bits, u64 pt_bits) {
         for (usize i = 0; i < 16; i++) {
             g->X[i] ^= g->buf[i];
         }
-        gf128_mul(g->X, g->H, g->X, g->impl);
+        gf128_mul(g, g->X, g->H, g->X);
 #if defined(__aarch64__)
         if (g->impl == CVMCRYPT_GCM_IMPL_PMULL) {
             vst1q_u64((uint64_t*)g->X_refl, vrev64_ld(g->X));
@@ -325,7 +346,7 @@ static void ghash_flush(CvmcryptGcm* g, u64 aad_bits, u64 pt_bits) {
     for (usize i = 0; i < 16; i++) {
         g->X[i] ^= lenblk[i];
     }
-    gf128_mul(g->X, g->H, g->X, g->impl);
+    gf128_mul(g, g->X, g->H, g->X);
 #if defined(__aarch64__)
     if (g->impl == CVMCRYPT_GCM_IMPL_PMULL) {
         vst1q_u64((uint64_t*)g->X_refl, vrev64_ld(g->X));
@@ -336,6 +357,36 @@ static void ghash_flush(CvmcryptGcm* g, u64 aad_bits, u64 pt_bits) {
 /* ------------------------------------------------------------------ */
 /* public API                                                          */
 /* ------------------------------------------------------------------ */
+
+/* Build BoringSSL's AES_KEY layout + GHASH table once per key.
+ * The table must come from VREV64(H): ring passes H as [u64; 2] via
+ * u64::from_be_bytes, i.e. a byte swap within each 8-byte half. Feeding
+ * raw H yields a table that silently produces wrong GHASH while the
+ * ciphertext stays correct. */
+static void gcm_asm_setup(CvmcryptGcm* g, usize keylen) {
+#if defined(__aarch64__)
+    /* AES-128/192/256 -> 10/12/14 rounds = keylen/4 + 6. */
+    int rounds = (int)(keylen / 4) + 6;
+    u8* dst = (u8*)g->aes_rk;
+    for (int r = 0; r <= rounds; r++) {
+        for (int j = 0; j < 4; j++) {
+            u32 w = g->aes.enc[4 * r + j];
+            usize o = (usize)(16 * r + 4 * j);
+            dst[o + 0] = (u8)(w >> 24);
+            dst[o + 1] = (u8)(w >> 16);
+            dst[o + 2] = (u8)(w >> 8);
+            dst[o + 3] = (u8)w;
+        }
+    }
+    g->aes_rk[60] = (u32)rounds;
+
+    u8 hrev[16];
+    vst1q_u8(hrev, vrev64q_u8(vld1q_u8(g->H)));
+    gcm_init_clmul(g->htable, hrev);
+#else
+    (void)g;
+#endif
+}
 
 static bool gcm_setup(CvmcryptGcm* g, u8 const* key, usize keylen, u8 const iv[12]) {
     if (!cvmcrypt_aes_setup(&g->aes, key, keylen)) {
@@ -368,6 +419,11 @@ static bool gcm_setup(CvmcryptGcm* g, u8 const* key, usize keylen, u8 const iv[1
     /* Build reflected-domain power table for 8-block GHASH. */
     if (g->impl == CVMCRYPT_GCM_IMPL_PMULL) {
         ghash_init_refl(g);
+        gcm_asm_setup(g, keylen);
+        /* TODO: the adopted kernel mis-handles AES-192/256 with >=4 blocks
+         * even though our key schedule is byte-identical to BoringSSL's.
+         * Keep those on the portable path until that is understood. */
+        g->asm_ok = (keylen == 16);
     }
 #endif
 
@@ -531,8 +587,10 @@ gcm_crypt_hash_loop(CvmcryptGcm* g, u8 const* in, u8* out, usize nbytes) {
 
 static void gcm_crypt(CvmcryptGcm* g, u8 const* in, usize len, u8* out) {
 #if defined(__aarch64__)
-    /* Fast path: 4 blocks with parallel AES (pipelined vaeseq). */
-    while (len >= 64) {
+    /* Fast path: 4 blocks with parallel AES (pipelined vaeseq).
+     * gcm_crypt_4 has 11 round keys baked in, i.e. AES-128 only; AES-192/
+     * 256 fall through to the per-block loop below. */
+    while (len >= 64 && g->aes.rounds == 10) {
         gcm_crypt_4(g, in, out);
         in += 64;
         out += 64;
@@ -578,7 +636,7 @@ bool cvmcrypt_gcm_encrypt(CvmcryptGcm* g, u8 const* key, usize keylen, u8 const 
         for (usize i = 0; i < 16; i++) {
             g->X[i] ^= g->buf[i];
         }
-        gf128_mul(g->X, g->H, g->X, g->impl);
+        gf128_mul(g, g->X, g->H, g->X);
 #if defined(__aarch64__)
         if (g->impl == CVMCRYPT_GCM_IMPL_PMULL) {
             vst1q_u64((uint64_t*)g->X_refl, vrev64_ld(g->X));
@@ -595,9 +653,22 @@ bool cvmcrypt_gcm_encrypt(CvmcryptGcm* g, u8 const* key, usize keylen, u8 const 
      * counter as-is for the first block (no pre-increment). */
     increment_counter(g->counter);
 
-    /* Encrypt + GHASH: fused 128-byte chunks, then remainder. */
+    /* Bulk: the adopted aesv8-gcm kernel does AES-CTR + GHASH in one pass.
+     * in_len is in BITS and only whole blocks are handled; the tail goes
+     * through the portable path. */
 #if defined(__aarch64__)
-    if (g->impl == CVMCRYPT_GCM_IMPL_PMULL && g->buflen == 0 && ptlen >= 128) {
+    if (g->impl == CVMCRYPT_GCM_IMPL_PMULL && g->asm_ok) {
+        usize nblk = ptlen & ~(usize)15;
+        if (nblk > 0) {
+            aes_gcm_enc_kernel(pt, (u64)nblk * 8, ct, g->X, g->counter, g->aes_rk,
+                               g->htable);
+            g->ptlen += (u64)nblk * 8;
+        }
+        if (ptlen > nblk) {
+            gcm_crypt(g, pt + nblk, ptlen - nblk, ct + nblk);
+            ghash_update(g, ct + nblk, ptlen - nblk, &g->ptlen);
+        }
+    } else if (0) {
         /* Sync X → X_refl for the fused loop. */
         vst1q_u64((uint64_t*)g->X_refl, vrev64_ld(g->X));
         usize n128 = ptlen & ~(usize)127;
@@ -654,7 +725,7 @@ bool cvmcrypt_gcm_decrypt(CvmcryptGcm* g, u8 const* key, usize keylen, u8 const 
         for (usize i = 0; i < 16; i++) {
             g->X[i] ^= g->buf[i];
         }
-        gf128_mul(g->X, g->H, g->X, g->impl);
+        gf128_mul(g, g->X, g->H, g->X);
 #if defined(__aarch64__)
         if (g->impl == CVMCRYPT_GCM_IMPL_PMULL) {
             vst1q_u64((uint64_t*)g->X_refl, vrev64_ld(g->X));

@@ -33,6 +33,16 @@ typedef struct CvmcryptGcm {
     u8 H_refl[8][32];
     /* Reflected-domain accumulator (VREV64 of running GHASH X). */
     u8 X_refl[16];
+#if defined(__aarch64__)
+    /* BoringSSL/OpenSSL aesv8-gcm layout, built once at setup: round keys
+     * as big-endian u32 at +0.., round count (u32) at byte 240. `aes.c`
+     * stays clean; only this side buffer knows the adopted asm's layout. */
+    u32 aes_rk[61];
+    /* GHASH table from gcm_init_clmul (built from VREV64(H)). */
+    u8 htable[256];
+    /* Non-zero when the adopted assembly kernel may be used. */
+    u8 asm_ok;
+#endif
     /* The counter block: J0 padded to 16 bytes. */
     u8 counter[16];
     /* Buffered partial block. */
