@@ -243,7 +243,20 @@ int main(int argc, char** argv) {
             if (t1 - t0 < best) best = t1 - t0;
         }
         double us = best * 1000.0 / N;
-        printf("X25519 key exchange:  %8.1f µs/op\n", us);
+        printf("X25519 shared secret: %8.1f µs/op\n", us);
+
+        /* Public-key generation uses the fixed-base comb, which is the
+         * other half of every ECDHE handshake. */
+        best = 1e9;
+        for (int r = 0; r < 3; r++) {
+            double t0 = now_ms();
+            for (int i = 0; i < N; i++)
+                cvmcrypt_x25519_base_fast(peer, priv);
+            double t1 = now_ms();
+            if (t1 - t0 < best) best = t1 - t0;
+        }
+        printf("X25519 public key:    %8.1f µs/op (fixed-base comb)\n",
+               best * 1000.0 / N);
     }
 
     /* --- TLS record encrypt (full pipeline) --- */

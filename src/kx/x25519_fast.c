@@ -7,6 +7,7 @@
  */
 
 #include "kx/x25519.h"
+#include "kx/x25519_comb_tables.h"
 #include "base/secure.h"
 
 /* GF(2^255-19): 5×51-bit limbs */
@@ -429,8 +430,270 @@ void cvmcrypt_x25519_fast(u8 out[32], u8 const scalar[32], u8 const point[32]) {
     fe_tobytes(out, &x2);
 }
 
+/* ------------------------------------------------------------------ */
+/* Fixed-base scalar multiplication (Ed25519-style comb)               */
+/*                                                                     */
+/* Adopted from BoringSSL's crypto/curve25519 (via ring 0.17.14).       */
+/* The Montgomery ladder costs ~2550 field ops for a scalar multiply;   */
+/* this costs ~64 mixed additions + 4 doublings because the base point  */
+/* is known, so its multiples can be precomputed. That is the 6.28 us   */
+/* path TLS 1.3 uses for its ephemeral public key.                      */
+/*                                                                     */
+/* `fe` and `fe_loose` in BoringSSL both map to our single Fe: our      */
+/* fe_add/fe_sub are lazy and our fe_mul reduces at the end, which is   */
+/* exactly the loose/tight contract. All fe_mul_* variants collapse to  */
+/* fe_mul.                                                             */
+/* ------------------------------------------------------------------ */
+
+typedef struct {
+    Fe X, Y, Z;
+} GeP2;
+typedef struct {
+    Fe X, Y, Z, T;
+} GeP3;
+typedef struct {
+    Fe YplusX, YminusX, Z, T2d;
+} GeCached;
+typedef struct {
+    Fe X, Y, Z, T;
+} GeP1P1;
+typedef struct {
+    Fe yplusx, yminusx, xy2d;
+} GePrecomp;
+
+static void fe_zero(Fe* h) {
+    h->l0 = h->l1 = h->l2 = h->l3 = h->l4 = 0;
+}
+static void fe_one(Fe* h) {
+    h->l0 = 1;
+    h->l1 = h->l2 = h->l3 = h->l4 = 0;
+}
+
+/* Reduce a loose element to tight bounds without multiplying. */
+static void fe_carry(Fe* h, Fe const* a) {
+    u64 r0 = a->l0, r1 = a->l1, r2 = a->l2, r3 = a->l3, r4 = a->l4, c;
+    c = r0 >> 51;
+    r0 &= M51;
+    r1 += c;
+    c = r1 >> 51;
+    r1 &= M51;
+    r2 += c;
+    c = r2 >> 51;
+    r2 &= M51;
+    r3 += c;
+    c = r3 >> 51;
+    r3 &= M51;
+    r4 += c;
+    c = r4 >> 51;
+    r4 &= M51;
+    r0 += c * 19;
+    c = r0 >> 51;
+    r0 &= M51;
+    r1 += c;
+    h->l0 = r0;
+    h->l1 = r1;
+    h->l2 = r2;
+    h->l3 = r3;
+    h->l4 = r4;
+}
+
+/* h = 2*a^2 */
+static void fe_sq2(Fe* h, Fe const* a) {
+    Fe t;
+    fe_sq(&t, a);
+    fe_add(h, &t, &t);
+    fe_carry(h, h);
+}
+
+/* h = -a */
+static void fe_neg(Fe* h, Fe const* a) {
+    Fe z;
+    fe_zero(&z);
+    fe_sub(h, &z, a);
+}
+
+static void fe_cmov(Fe* a, Fe const* b, u8 sel) {
+    u64 mask = (u64)0 - (u64)sel;
+    a->l0 ^= mask & (a->l0 ^ b->l0);
+    a->l1 ^= mask & (a->l1 ^ b->l1);
+    a->l2 ^= mask & (a->l2 ^ b->l2);
+    a->l3 ^= mask & (a->l3 ^ b->l3);
+    a->l4 ^= mask & (a->l4 ^ b->l4);
+}
+
+static u8 ct_is_zero(u32 a) {
+    return (u8)((((u32)a - 1) >> 31) & 1);
+}
+static u8 ct_eq(u32 a, u32 b) {
+    return ct_is_zero(a ^ b);
+}
+
+static void ge_p3_zero(GeP3* h) {
+    fe_zero(&h->X);
+    fe_one(&h->Y);
+    fe_one(&h->Z);
+    fe_zero(&h->T);
+}
+
+static void ge_p3_to_p2(GeP2* r, GeP3 const* p) {
+    r->X = p->X;
+    r->Y = p->Y;
+    r->Z = p->Z;
+}
+
+static void ge_p1p1_to_p2(GeP2* r, GeP1P1 const* p) {
+    fe_mul(&r->X, &p->X, &p->T);
+    fe_mul(&r->Y, &p->Y, &p->Z);
+    fe_mul(&r->Z, &p->Z, &p->T);
+}
+
+static void ge_p1p1_to_p3(GeP3* r, GeP1P1 const* p) {
+    fe_mul(&r->X, &p->X, &p->T);
+    fe_mul(&r->Y, &p->Y, &p->Z);
+    fe_mul(&r->Z, &p->Z, &p->T);
+    fe_mul(&r->T, &p->X, &p->Y);
+}
+
+static void ge_p2_dbl(GeP1P1* r, GeP2 const* p) {
+    Fe trX, trZ, trT, t0;
+    fe_sq(&trX, &p->X);
+    fe_sq(&trZ, &p->Y);
+    fe_sq2(&trT, &p->Z);
+    fe_add(&r->Y, &p->X, &p->Y);
+    fe_sq(&t0, &r->Y);
+    fe_add(&r->Y, &trZ, &trX);
+    fe_sub(&r->Z, &trZ, &trX);
+    fe_carry(&trZ, &r->Y);
+    fe_sub(&r->X, &t0, &trZ);
+    fe_carry(&trZ, &r->Z);
+    fe_sub(&r->T, &trT, &trZ);
+}
+
+static void ge_p3_dbl(GeP1P1* r, GeP3 const* p) {
+    GeP2 q;
+    ge_p3_to_p2(&q, p);
+    ge_p2_dbl(r, &q);
+}
+
+static void ge_madd(GeP1P1* r, GeP3 const* p, GePrecomp const* q) {
+    Fe trY, trZ, trT;
+    fe_add(&r->X, &p->Y, &p->X);
+    fe_sub(&r->Y, &p->Y, &p->X);
+    fe_mul(&trZ, &r->X, &q->yplusx);
+    fe_mul(&trY, &r->Y, &q->yminusx);
+    fe_mul(&trT, &q->xy2d, &p->T);
+    fe_add(&r->T, &p->Z, &p->Z);
+    fe_sub(&r->X, &trZ, &trY);
+    fe_add(&r->Y, &trZ, &trY);
+    fe_carry(&trZ, &r->T);
+    fe_add(&r->Z, &trZ, &trT);
+    fe_sub(&r->T, &trZ, &trT);
+}
+
+/* Pick the precomputed multiple for a signed 4-bit digit, in constant time. */
+static void table_select(GePrecomp* t, i32 pos, i8 b) {
+    /* constant_time_msb_w returns a full 0xFF..FF mask, not 1: babs is
+     * computed as b - 2b for negative b. Using 1 here yields 251 instead
+     * of |b| for every negative digit, which silently drops those digits
+     * (only visible when the scalar has digits >= 8 after the recode). */
+    u8 bneg_mask = (u8)(0 - (u8)((u8)b >> 7));
+    u8 bnegative = (u8)(bneg_mask & 1);
+    u8 babs = (u8)((u8)b - (u8)((bneg_mask & (u8)b) << 1));
+    /* BoringSSL's `{{mask}, {mask}, {0}}` sets only byte 0 of each row;
+     * the remaining bytes stay zero. Writing the mask to all 32 bytes
+     * would produce 0x0101...01 instead of the field element 1. */
+    u8 t_bytes[3][32];
+    for (i32 i = 0; i < 32; i++) {
+        t_bytes[0][i] = 0;
+        t_bytes[1][i] = 0;
+        t_bytes[2][i] = 0;
+    }
+    {
+        u8 z = ct_is_zero((u32)babs);
+        t_bytes[0][0] = z;
+        t_bytes[1][0] = z;
+    }
+    for (i32 i = 0; i < 8; i++) {
+        u8 m = (u8)(0 - ct_eq((u32)babs, (u32)(1 + i)));
+        for (i32 j = 0; j < 32; j++) {
+            t_bytes[0][j] ^= k25519Precomp[pos][i][0][j] & m;
+            t_bytes[1][j] ^= k25519Precomp[pos][i][1][j] & m;
+            t_bytes[2][j] ^= k25519Precomp[pos][i][2][j] & m;
+        }
+    }
+    fe_frombytes(&t->yplusx, t_bytes[0]);
+    fe_frombytes(&t->yminusx, t_bytes[1]);
+    fe_frombytes(&t->xy2d, t_bytes[2]);
+
+    GePrecomp minust;
+    minust.yplusx = t->yminusx;
+    minust.yminusx = t->yplusx;
+    fe_neg(&minust.xy2d, &t->xy2d);
+    fe_cmov(&t->yplusx, &minust.yplusx, bnegative);
+    fe_cmov(&t->yminusx, &minust.yminusx, bnegative);
+    fe_cmov(&t->xy2d, &minust.xy2d, bnegative);
+}
+
+/* h = a * B, a[31] <= 127 (clamped). */
+static void ge_scalarmult_base(GeP3* h, u8 const a[32]) {
+    i8 e[64];
+    i8 carry;
+    GeP1P1 r;
+    GeP2 s;
+    GePrecomp t;
+    i32 i;
+
+    for (i = 0; i < 32; i++) {
+        e[2 * i + 0] = (i8)((a[i] >> 0) & 15);
+        e[2 * i + 1] = (i8)((a[i] >> 4) & 15);
+    }
+    carry = 0;
+    for (i = 0; i < 63; i++) {
+        e[i] = (i8)(e[i] + carry);
+        carry = (i8)((e[i] + 8) >> 4);
+        e[i] = (i8)(e[i] - (i8)(carry << 4));
+    }
+    e[63] = (i8)(e[63] + carry);
+
+    ge_p3_zero(h);
+    for (i = 1; i < 64; i += 2) {
+        table_select(&t, i / 2, e[i]);
+        ge_madd(&r, h, &t);
+        ge_p1p1_to_p3(h, &r);
+    }
+
+    ge_p3_dbl(&r, h);
+    ge_p1p1_to_p2(&s, &r);
+    ge_p2_dbl(&r, &s);
+    ge_p1p1_to_p2(&s, &r);
+    ge_p2_dbl(&r, &s);
+    ge_p1p1_to_p2(&s, &r);
+    ge_p2_dbl(&r, &s);
+    ge_p1p1_to_p3(h, &r);
+
+    for (i = 0; i < 64; i += 2) {
+        table_select(&t, i / 2, e[i]);
+        ge_madd(&r, h, &t);
+        ge_p1p1_to_p3(h, &r);
+    }
+}
+
 /* Base point multiplication: out = scalar * basepoint. */
 void cvmcrypt_x25519_base_fast(u8 public_key[32], u8 const scalar[32]) {
-    static u8 const basepoint[32] = {9};
-    cvmcrypt_x25519_fast(public_key, scalar, basepoint);
+    u8 e[32];
+    for (int i = 0; i < 32; i++)
+        e[i] = scalar[i];
+    e[0] &= 248;
+    e[31] &= 127;
+    e[31] |= 64;
+
+    /* u = (Z + Y) / (Z - Y) */
+    GeP3 a;
+    ge_scalarmult_base(&a, e);
+    Fe zplusy, zminusy, inv;
+    fe_add(&zplusy, &a.Z, &a.Y);
+    fe_sub(&zminusy, &a.Z, &a.Y);
+    fe_invert(&inv, &zminusy);
+    fe_mul(&zplusy, &zplusy, &inv);
+    fe_tobytes(public_key, &zplusy);
 }
