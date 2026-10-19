@@ -188,61 +188,11 @@ bool cvmcrypt_aes_setup(CvmcryptAesKey* key, u8 const* user_key, usize keylen) {
 /* arm64 dedicated instructions                                        */
 /* ------------------------------------------------------------------ */
 
-#if defined(__aarch64__) && !defined(CVMCRYPT_AES_FORCE_SCALAR)
-#include <arm_neon.h>
-
-/* Store round keys as raw bytes alongside the u32 schedule, in the byte
- * order the AESE/AESD instructions expect (which is the AES state order).
- * We compute this once at setup time. */
-
-void cvmcrypt_aes_encrypt_block(CvmcryptAesKey const* key, u8 const in[16],
-                                u8 out[16]) {
-    /* AESE does SubBytes(state XOR key) + ShiftRows internally, so the
-     * initial AddRoundKey is folded into the first AESE call. The final
-     * round key is applied as a separate veor because the last AESE
-     * doesn't include it. Pattern verified against FIPS 197 C.1. */
-    uint8x16_t state = vld1q_u8(in);
-    uint8x16_t rk;
-
-    for (u32 r = 0; r < key->rounds - 1; r++) {
-        rk = vrev32q_u8(vld1q_u8((u8 const*)&key->enc[4 * r]));
-        state = vaeseq_u8(state, rk);
-        state = vaesmcq_u8(state);
-    }
-    rk = vrev32q_u8(vld1q_u8((u8 const*)&key->enc[4 * (key->rounds - 1)]));
-    state = vaeseq_u8(state, rk);
-    rk = vrev32q_u8(vld1q_u8((u8 const*)&key->enc[4 * key->rounds]));
-    state = veorq_u8(state, rk);
-    vst1q_u8(out, state);
-}
-
-void cvmcrypt_aes_decrypt_block(CvmcryptAesKey const* key, u8 const in[16],
-                                u8 out[16]) {
-    /* Same pattern with AESD/AESIMC: no initial veor, final explicit veor.
-     * Round keys in reverse order (dec key schedule). */
-    uint8x16_t state = vld1q_u8(in);
-    uint8x16_t rk;
-
-    for (u32 r = 0; r < key->rounds - 1; r++) {
-        rk = vrev32q_u8(vld1q_u8((u8 const*)&key->dec[4 * (key->rounds - r)]));
-        state = vaesdq_u8(state, rk);
-        state = vaesimcq_u8(state);
-    }
-    rk = vrev32q_u8(vld1q_u8((u8 const*)&key->dec[4 * 1]));
-    state = vaesdq_u8(state, rk);
-    rk = vrev32q_u8(vld1q_u8((u8 const*)&key->dec[0]));
-    state = veorq_u8(state, rk);
-    vst1q_u8(out, state);
-}
-
-#else /* scalar */
-
-/* ------------------------------------------------------------------ */
-/* scalar S-box path                                                   */
-/* ------------------------------------------------------------------ */
-
-void cvmcrypt_aes_encrypt_block(CvmcryptAesKey const* key, u8 const in[16],
-                                u8 out[16]) {
+/* Portable fallback. Indexes a 256-byte SBOX with the AES state, so it
+ * is NOT constant-time; every platform with AES hardware instructions
+ * takes one of the branches below instead. */
+__attribute__((unused)) static void
+aes_encrypt_block_scalar(CvmcryptAesKey const* key, u8 const in[16], u8 out[16]) {
     u32 s[4], t[4];
 
     for (usize i = 0; i < 4; i++) {
@@ -291,8 +241,8 @@ void cvmcrypt_aes_encrypt_block(CvmcryptAesKey const* key, u8 const in[16],
     }
 }
 
-void cvmcrypt_aes_decrypt_block(CvmcryptAesKey const* key, u8 const in[16],
-                                u8 out[16]) {
+__attribute__((unused)) static void
+aes_decrypt_block_scalar(CvmcryptAesKey const* key, u8 const in[16], u8 out[16]) {
     u32 s[4], t[4];
 
     for (usize i = 0; i < 4; i++) {
@@ -348,4 +298,121 @@ void cvmcrypt_aes_decrypt_block(CvmcryptAesKey const* key, u8 const in[16],
     }
 }
 
-#endif /* __aarch64__ / scalar */
+#if defined(__aarch64__) && !defined(CVMCRYPT_AES_FORCE_SCALAR)
+#include <arm_neon.h>
+
+/* Store round keys as raw bytes alongside the u32 schedule, in the byte
+ * order the AESE/AESD instructions expect (which is the AES state order).
+ * We compute this once at setup time. */
+
+void cvmcrypt_aes_encrypt_block(CvmcryptAesKey const* key, u8 const in[16],
+                                u8 out[16]) {
+    /* AESE does SubBytes(state XOR key) + ShiftRows internally, so the
+     * initial AddRoundKey is folded into the first AESE call. The final
+     * round key is applied as a separate veor because the last AESE
+     * doesn't include it. Pattern verified against FIPS 197 C.1. */
+    uint8x16_t state = vld1q_u8(in);
+    uint8x16_t rk;
+
+    for (u32 r = 0; r < key->rounds - 1; r++) {
+        rk = vrev32q_u8(vld1q_u8((u8 const*)&key->enc[4 * r]));
+        state = vaeseq_u8(state, rk);
+        state = vaesmcq_u8(state);
+    }
+    rk = vrev32q_u8(vld1q_u8((u8 const*)&key->enc[4 * (key->rounds - 1)]));
+    state = vaeseq_u8(state, rk);
+    rk = vrev32q_u8(vld1q_u8((u8 const*)&key->enc[4 * key->rounds]));
+    state = veorq_u8(state, rk);
+    vst1q_u8(out, state);
+}
+
+void cvmcrypt_aes_decrypt_block(CvmcryptAesKey const* key, u8 const in[16],
+                                u8 out[16]) {
+    /* Same pattern with AESD/AESIMC: no initial veor, final explicit veor.
+     * Round keys in reverse order (dec key schedule). */
+    uint8x16_t state = vld1q_u8(in);
+    uint8x16_t rk;
+
+    for (u32 r = 0; r < key->rounds - 1; r++) {
+        rk = vrev32q_u8(vld1q_u8((u8 const*)&key->dec[4 * (key->rounds - r)]));
+        state = vaesdq_u8(state, rk);
+        state = vaesimcq_u8(state);
+    }
+    rk = vrev32q_u8(vld1q_u8((u8 const*)&key->dec[4 * 1]));
+    state = vaesdq_u8(state, rk);
+    rk = vrev32q_u8(vld1q_u8((u8 const*)&key->dec[0]));
+    state = veorq_u8(state, rk);
+    vst1q_u8(out, state);
+}
+
+#elif defined(__x86_64__) && !defined(CVMCRYPT_AES_FORCE_SCALAR)
+#include <immintrin.h>
+
+/* AES-NI path. The scalar path below indexes a 256-byte SBOX with the AES
+ * state, which is a cache-timing side channel; AES-NI removes the table
+ * entirely. Gated at setup on AES-NI + SSSE3 (see cvmcrypt_aes_use_ni). */
+
+/* Reverse the bytes within each 32-bit word: our enc[] holds the FIPS
+ * words as host u32, AES-NI wants them as the FIPS byte string. */
+static inline __m128i aes_ni_rk(u32 const* w) {
+    __m128i v = _mm_loadu_si128((__m128i const*)w);
+    __m128i m = _mm_setr_epi8(3, 2, 1, 0, 7, 6, 5, 4, 11, 10, 9, 8, 15, 14, 13, 12);
+    return _mm_shuffle_epi8(v, m);
+}
+
+/* NOTE: AESENC applies the round key at the END of the round, while arm64's
+ * AESE applies it at the START. So this is the standard AES-NI order
+ * (xor key0, AESENC k1..k{Nr-1}, AESENCLAST k_Nr), not a transliteration of
+ * the AESE loop above. */
+static u8 aes_x86_has_ni(void) {
+    u32 a, b, c, d;
+    __asm__ volatile("cpuid" : "=a"(a), "=b"(b), "=c"(c), "=d"(d) : "a"(1), "c"(0));
+    (void)a;
+    (void)b;
+    (void)d;
+    return (u8)(((c >> 25) & 1) && ((c >> 9) & 1)); /* AES-NI + SSSE3 */
+}
+
+__attribute__((target("aes,ssse3"))) static void
+aes_encrypt_block_ni(CvmcryptAesKey const* key, u8 const in[16], u8 out[16]) {
+    __m128i s = _mm_loadu_si128((__m128i const*)in);
+    u32 nr = key->rounds;
+
+    s = _mm_xor_si128(s, aes_ni_rk(&key->enc[0]));
+    for (u32 r = 1; r < nr; r++) {
+        s = _mm_aesenc_si128(s, aes_ni_rk(&key->enc[4 * r]));
+    }
+    s = _mm_aesenclast_si128(s, aes_ni_rk(&key->enc[4 * nr]));
+    _mm_storeu_si128((__m128i*)out, s);
+}
+
+void cvmcrypt_aes_encrypt_block(CvmcryptAesKey const* key, u8 const in[16],
+                                u8 out[16]) {
+    if (aes_x86_has_ni()) {
+        aes_encrypt_block_ni(key, in, out);
+    } else {
+        aes_encrypt_block_scalar(key, in, out);
+    }
+}
+
+/* Decrypt is not on the TLS path (GCM is counter mode) and stays scalar;
+ * AES-NI decrypt needs the equivalent-inverse key handling, which is a
+ * separate change. */
+void cvmcrypt_aes_decrypt_block(CvmcryptAesKey const* key, u8 const in[16],
+                                u8 out[16]) {
+    aes_decrypt_block_scalar(key, in, out);
+}
+
+#else /* no hardware AES: both entry points are the scalar path */
+
+void cvmcrypt_aes_encrypt_block(CvmcryptAesKey const* key, u8 const in[16],
+                                u8 out[16]) {
+    aes_encrypt_block_scalar(key, in, out);
+}
+
+void cvmcrypt_aes_decrypt_block(CvmcryptAesKey const* key, u8 const in[16],
+                                u8 out[16]) {
+    aes_decrypt_block_scalar(key, in, out);
+}
+
+#endif /* __aarch64__ / __x86_64__ / scalar */
