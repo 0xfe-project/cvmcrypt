@@ -699,6 +699,16 @@ int cvm_tls_handshake(CvmTls* tls, CvmTlsBuf* sendbuf, void const* input, usize*
     usize remaining = *inlen;
 
     while (remaining > 0) {
+        /*
+         * Stop as soon as the handshake is complete and leave the rest of the
+         * buffer unconsumed. A peer's first application record routinely
+         * arrives in the same read as its Finished; this loop handles only
+         * handshake records, so anything it consumes past this point is
+         * silently dropped — which shows up much later as a protocol stream
+         * missing its first few bytes.
+         */
+        if (tls->handshake_complete)
+            break;
         CvmTlsRecord rec;
         usize consumed = remaining;
         ret = cvm_tls_parse_record(&rec, src, &consumed, &tls->recvbuf_rec);
