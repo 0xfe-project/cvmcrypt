@@ -19,25 +19,17 @@
 #define CVMCRYPT_X25519_SHARED_SIZE ((usize)32)
 
 /*
- * Compute the X25519 function: scalar * u_coordinate.
- * Both arrays are 32 bytes, little-endian.
+ * X25519 (RFC 7748), 5x51-bit limbs with __int128 multiplication.
+ *
+ * Both arrays are 32 bytes, little-endian. The scalar is clamped internally
+ * per RFC 7748 §5.
+ *
+ * This is the only X25519 in the tree. The tweetnacl 16-limb ladder that used
+ * to sit beside it was unused by the library, was not what TLS called, and
+ * produced wrong public keys roughly one run in fifteen under AddressSanitizer
+ * — a layout-dependent bug that was never root-caused. It was deleted rather
+ * than left as a second, unreliable answer to the same question.
  */
-void cvmcrypt_x25519(u8 out[32], u8 const scalar[32], u8 const u_point[32]);
-
-/*
- * Generate a public key from a private scalar.
- * The scalar is clamped per RFC 7748 §5.
- */
-void cvmcrypt_x25519_base(u8 public_key[32], u8 const scalar[32]);
-
-/*
- * Derive a shared secret from a private scalar and peer public key.
- * Returns the 32-byte shared secret, or all zeros on invalid input.
- */
-void cvmcrypt_x25519_shared(u8 shared[32], u8 const scalar[32],
-                            u8 const peer_public[32]);
-
-/* Fast implementation using 5x51-bit limbs (ARM64). */
 void cvmcrypt_x25519_fast(u8 out[32], u8 const scalar[32], u8 const point[32]);
 void cvmcrypt_x25519_base_fast(u8 public_key[32], u8 const scalar[32]);
 

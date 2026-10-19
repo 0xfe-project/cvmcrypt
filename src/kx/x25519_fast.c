@@ -364,8 +364,20 @@ void cvmcrypt_x25519_fast(u8 out[32], u8 const scalar[32], u8 const point[32]) {
     e[31] &= 127;
     e[31] |= 64;
 
+    /*
+     * RFC 7748 §5: the most significant bit of the final byte of the
+     * u-coordinate MUST be masked. fe_frombytes folds bit 255 in as +19
+     * instead, which is the same value modulo p but not the same input —
+     * a peer that sets the bit would compute a different shared secret
+     * from ours. RFC 7748 §5.2 test vector 2 is exactly that case.
+     */
+    u8 u[32];
+    for (int i = 0; i < 32; i++)
+        u[i] = point[i];
+    u[31] &= 127;
+
     Fe x1, x2, z2, x3, z3, tmp0, tmp1;
-    fe_frombytes(&x1, point);
+    fe_frombytes(&x1, u);
     x2 = (Fe){1, 0, 0, 0, 0}; /* one */
     z2 = (Fe){0, 0, 0, 0, 0}; /* zero */
     x3 = x1;

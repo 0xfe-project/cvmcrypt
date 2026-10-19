@@ -46,7 +46,7 @@ TEST rfc7748_s5_2_tv1(void) {
         point[i] = (u8)strtoul(h, NULL, 16);
     }
 
-    cvmcrypt_x25519(out, scalar, point);
+    cvmcrypt_x25519_fast(out, scalar, point);
     ASSERT(hex_eq(out, expect_hex, 32));
     PASS();
 }
@@ -69,7 +69,7 @@ TEST rfc7748_s5_2_tv2(void) {
         point[i] = (u8)strtoul(h, NULL, 16);
     }
 
-    cvmcrypt_x25519(out, scalar, point);
+    cvmcrypt_x25519_fast(out, scalar, point);
     ASSERT(hex_eq(out, expect_hex, 32));
     PASS();
 }
@@ -95,25 +95,29 @@ TEST rfc7748_dh(void) {
         "4a5d9d5ba4ce2de1728e3bf480350f25e07e21c947d19e3376f09b3c1e161742";
 
     for (usize i = 0; i < 32; i++) {
-        char h[3];
-        h[0] = alice_priv_hex[2 * i];
-        h[1] = alice_priv_hex[2 * i + 1];
+        /* h[2] must be the NUL: strtoul reads until a non-digit, and an
+         * uninitialised third byte made this parse one digit too many
+         * whenever the stack happened to hold a hex character there. That
+         * produced a wrong private key, and therefore a wrong public key,
+         * roughly one run in ten under AddressSanitizer. */
+        char h[3] = {alice_priv_hex[2 * i], alice_priv_hex[2 * i + 1], 0};
         alice_priv[i] = (u8)strtoul(h, NULL, 16);
         h[0] = bob_priv_hex[2 * i];
         h[1] = bob_priv_hex[2 * i + 1];
+        h[2] = 0;
         bob_priv[i] = (u8)strtoul(h, NULL, 16);
     }
 
     /* Generate public keys. */
-    cvmcrypt_x25519_base(alice_pub, alice_priv);
-    cvmcrypt_x25519_base(bob_pub, bob_priv);
+    cvmcrypt_x25519_base_fast(alice_pub, alice_priv);
+    cvmcrypt_x25519_base_fast(bob_pub, bob_priv);
 
     ASSERT(hex_eq(alice_pub, alice_pub_hex, 32));
     ASSERT(hex_eq(bob_pub, bob_pub_hex, 32));
 
     /* Both sides derive the same shared secret. */
-    cvmcrypt_x25519_shared(shared_alice, alice_priv, bob_pub);
-    cvmcrypt_x25519_shared(shared_bob, bob_priv, alice_pub);
+    cvmcrypt_x25519_fast(shared_alice, alice_priv, bob_pub);
+    cvmcrypt_x25519_fast(shared_bob, bob_priv, alice_pub);
 
     ASSERT(hex_eq(shared_alice, shared_hex, 32));
     ASSERT_EQ(0, memcmp(shared_alice, shared_bob, 32));
@@ -130,7 +134,7 @@ TEST rfc7748_iterated(void) {
     u[0] = 9;
 
     for (usize iter = 0; iter < 1; iter++) {
-        cvmcrypt_x25519(out, k, u);
+        cvmcrypt_x25519_fast(out, k, u);
         memcpy(u, k, 32);
         memcpy(k, out, 32);
     }
