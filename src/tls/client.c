@@ -375,9 +375,34 @@ static int client_handle_message(CvmTls* tls, CvmTlsBuf* sendbuf, CvmTlsVec mess
             ret = cvm_tls_decode_finished(&fin, message.base + 4,
                                           message.base + message.len);
             if (ret == 0) {
-                /* TODO: verify Finished (needs proper transcript). */
-                /* Derive application traffic secrets. */
-                ret = cvm_tls_ks_extract(&tls->ks, (CvmTlsVec){NULL, 0}); /* master */
+                usize const dlen = tls->suite->hash->digest_size;
+
+                /*
+                 * 1. Verify the server's Finished against the transcript as
+                 *    it stands now — which excludes this message, since the
+                 *    transcript here covers everything up to but not
+                 *    including it.
+                 */
+                u8 expected[TLS_MAX_DIGEST_SIZE];
+                ret = cvm_tls_ks_calc_verify_data(&tls->ks, expected,
+                                                  tls->server_hs_secret);
+                if (ret == 0) {
+                    if (fin.verify_data.len != dlen ||
+                        !cvmcrypt_ct_eq(fin.verify_data.base, expected, dlen)) {
+                        ret = TLS_ALERT_DECRYPT_ERROR;
+                    }
+                }
+                memset(expected, 0, sizeof(expected));
+
+                /*
+                 * 2. The server's Finished now joins the transcript. The
+                 *    application secrets and our own Finished are both
+                 *    derived from the transcript that includes it.
+                 */
+                if (ret == 0) {
+                    cvm_tls_ks_update_hash(&tls->ks, message.base, message.len);
+                    ret = cvm_tls_ks_extract(&tls->ks, (CvmTlsVec){NULL, 0});
+                }
                 if (ret == 0) {
                     ret = cvm_tls_ks_derive_secret(&tls->ks, tls->server_ap_secret,
                                                    "s ap traffic");
@@ -385,6 +410,35 @@ static int client_handle_message(CvmTls* tls, CvmTlsBuf* sendbuf, CvmTlsVec mess
                         ret = cvm_tls_ks_derive_secret(&tls->ks, tls->client_ap_secret,
                                                        "c ap traffic");
                 }
+
+                /*
+                 * 3. Our Finished, computed over the same transcript and sent
+                 *    with the HANDSHAKE keys — so it must go out before the
+                 *    application keys replace tls->enc below.
+                 */
+                if (ret == 0) {
+                    u8 verify_data[TLS_MAX_DIGEST_SIZE];
+                    ret = cvm_tls_ks_calc_verify_data(&tls->ks, verify_data,
+                                                      tls->client_hs_secret);
+                    if (ret == 0) {
+                        CvmTlsBuf fin_buf;
+                        cvm_tls_buf_init(&fin_buf, NULL, 0);
+                        ret = cvm_tls_encode_finished(&fin_buf,
+                                                      (CvmTlsVec){verify_data, dlen});
+                        if (ret == 0) {
+                            ret = cvm_tls_push_encrypted_records(
+                                sendbuf, TLS_CONTENT_TYPE_HANDSHAKE, fin_buf.base,
+                                fin_buf.off, &tls->enc);
+                        }
+                        if (ret == 0) {
+                            cvm_tls_ks_update_hash(&tls->ks, fin_buf.base, fin_buf.off);
+                        }
+                        cvm_tls_buf_dispose(&fin_buf);
+                    }
+                    memset(verify_data, 0, sizeof(verify_data));
+                }
+
+                /* 4. Switch to application keys. */
                 if (ret == 0) {
                     ret = setup_traffic_protection(tls, false, 3, tls->server_ap_secret,
                                                    "s ap traffic");
@@ -413,6 +467,16 @@ static int client_handle_message(CvmTls* tls, CvmTlsBuf* sendbuf, CvmTlsVec mess
     default:
         ret = TLS_ALERT_INTERNAL_ERROR;
         break;
+    }
+
+    /*
+     * Every handshake message joins the transcript. ServerHello and Finished
+     * are hashed inside their own branches because their ordering relative to
+     * a key derivation matters; everything else is hashed here.
+     */
+    if (ret == 0 && type != TLS_HANDSHAKE_TYPE_SERVER_HELLO &&
+        type != TLS_HANDSHAKE_TYPE_FINISHED) {
+        cvm_tls_ks_update_hash(&tls->ks, message.base, message.len);
     }
 
     return ret;

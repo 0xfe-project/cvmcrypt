@@ -154,8 +154,14 @@ static void cvm_gcm_encrypt(CvmTlsAead* _ctx, u8* output, u8 const* input, usize
     Gcm128Tls* ctx = (Gcm128Tls*)_ctx;
     u8 nonce[12];
     memcpy(nonce, ctx->static_iv, 12);
+    /*
+     * RFC 8446 §5.3: the 64-bit record sequence number is left-padded to the
+     * IV length and XORed in. For a 12-byte IV that puts it in the LAST eight
+     * bytes. XORing into the first eight is invisible at seq 0 (all zeros)
+     * and breaks every record after the first.
+     */
     for (int i = 0; i < 8; i++)
-        nonce[i] ^= (u8)(seq >> (56 - i * 8));
+        nonce[4 + i] ^= (u8)(seq >> (56 - i * 8));
     /* output = ciphertext || tag. Key-derived state was built once in
      * setup, so this is just the per-message work. */
     cvmcrypt_gcm_seal(&ctx->gcm, nonce, (u8 const*)aad, aadlen, input, inlen, output,
@@ -167,8 +173,14 @@ static usize cvm_gcm_decrypt(CvmTlsAead* _ctx, u8* output, u8 const* input, usiz
     Gcm128Tls* ctx = (Gcm128Tls*)_ctx;
     u8 nonce[12];
     memcpy(nonce, ctx->static_iv, 12);
+    /*
+     * RFC 8446 §5.3: the 64-bit record sequence number is left-padded to the
+     * IV length and XORed in. For a 12-byte IV that puts it in the LAST eight
+     * bytes. XORing into the first eight is invisible at seq 0 (all zeros)
+     * and breaks every record after the first.
+     */
     for (int i = 0; i < 8; i++)
-        nonce[i] ^= (u8)(seq >> (56 - i * 8));
+        nonce[4 + i] ^= (u8)(seq >> (56 - i * 8));
     /* input = ciphertext || tag */
     bool ok = cvmcrypt_gcm_open(&ctx->gcm, nonce, (u8 const*)aad, aadlen, input,
                                 inlen - 16, output, input + inlen - 16);
@@ -222,8 +234,14 @@ static void cvm_gcm256_encrypt(CvmTlsAead* _ctx, u8* output, u8 const* input,
     Gcm256Tls* ctx = (Gcm256Tls*)_ctx;
     u8 nonce[12];
     memcpy(nonce, ctx->static_iv, 12);
+    /*
+     * RFC 8446 §5.3: the 64-bit record sequence number is left-padded to the
+     * IV length and XORed in. For a 12-byte IV that puts it in the LAST eight
+     * bytes. XORing into the first eight is invisible at seq 0 (all zeros)
+     * and breaks every record after the first.
+     */
     for (int i = 0; i < 8; i++)
-        nonce[i] ^= (u8)(seq >> (56 - i * 8));
+        nonce[4 + i] ^= (u8)(seq >> (56 - i * 8));
     cvmcrypt_gcm_seal(&ctx->gcm, nonce, (u8 const*)aad, aadlen, input, inlen, output,
                       output + inlen);
 }
@@ -233,8 +251,14 @@ static usize cvm_gcm256_decrypt(CvmTlsAead* _ctx, u8* output, u8 const* input,
     Gcm256Tls* ctx = (Gcm256Tls*)_ctx;
     u8 nonce[12];
     memcpy(nonce, ctx->static_iv, 12);
+    /*
+     * RFC 8446 §5.3: the 64-bit record sequence number is left-padded to the
+     * IV length and XORed in. For a 12-byte IV that puts it in the LAST eight
+     * bytes. XORing into the first eight is invisible at seq 0 (all zeros)
+     * and breaks every record after the first.
+     */
     for (int i = 0; i < 8; i++)
-        nonce[i] ^= (u8)(seq >> (56 - i * 8));
+        nonce[4 + i] ^= (u8)(seq >> (56 - i * 8));
     bool ok = cvmcrypt_gcm_open(&ctx->gcm, nonce, (u8 const*)aad, aadlen, input,
                                 inlen - 16, output, input + inlen - 16);
     return ok ? inlen - 16 : (usize)-1;
@@ -286,8 +310,14 @@ static void cvm_chacha_encrypt(CvmTlsAead* _ctx, u8* output, u8 const* input,
     ChaChaTls* ctx = (ChaChaTls*)_ctx;
     u8 nonce[12];
     memcpy(nonce, ctx->static_iv, 12);
+    /*
+     * RFC 8446 §5.3: the 64-bit record sequence number is left-padded to the
+     * IV length and XORed in. For a 12-byte IV that puts it in the LAST eight
+     * bytes. XORing into the first eight is invisible at seq 0 (all zeros)
+     * and breaks every record after the first.
+     */
     for (int i = 0; i < 8; i++)
-        nonce[i] ^= (u8)(seq >> (56 - i * 8));
+        nonce[4 + i] ^= (u8)(seq >> (56 - i * 8));
     /* cvmcrypt_chachapoly_encrypt(ctx, key, nonce, aad, aadlen, pt, ptlen, ct, tag) */
     cvmcrypt_chachapoly_encrypt(ctx->key, nonce, (u8 const*)aad, aadlen, input, inlen,
                                 output, output + inlen);
@@ -298,8 +328,14 @@ static usize cvm_chacha_decrypt(CvmTlsAead* _ctx, u8* output, u8 const* input,
     ChaChaTls* ctx = (ChaChaTls*)_ctx;
     u8 nonce[12];
     memcpy(nonce, ctx->static_iv, 12);
+    /*
+     * RFC 8446 §5.3: the 64-bit record sequence number is left-padded to the
+     * IV length and XORed in. For a 12-byte IV that puts it in the LAST eight
+     * bytes. XORing into the first eight is invisible at seq 0 (all zeros)
+     * and breaks every record after the first.
+     */
     for (int i = 0; i < 8; i++)
-        nonce[i] ^= (u8)(seq >> (56 - i * 8));
+        nonce[4 + i] ^= (u8)(seq >> (56 - i * 8));
     bool ok =
         cvmcrypt_chachapoly_decrypt(ctx->key, nonce, (u8 const*)aad, aadlen, input,
                                     inlen - 16, output, input + inlen - 16);

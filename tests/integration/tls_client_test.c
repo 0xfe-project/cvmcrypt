@@ -183,6 +183,13 @@ int main(int argc, char** argv) {
             break;
         }
         printf("[3.%d] Received %zd bytes from server\n", round, n);
+        {
+            FILE* f = fopen("/tmp/recv.bin", "wb");
+            if (f) {
+                fwrite(input, 1, (size_t)n, f);
+                fclose(f);
+            }
+        }
 
         /* Feed to TLS state machine. */
         sendbuf.off = 0; /* reuse sendbuf for output */
