@@ -116,40 +116,44 @@ static void fe_sub(Fe* h, Fe const* a, Fe const* b) {
 }
 
 static void fe_mul(Fe* h, Fe const* a, Fe const* b) {
-    /* Go's feMulGeneric: multiply by 19 during accumulation, no t5..t8. */
+    /* Go's feMulGeneric: multiply by 19 during accumulation, no t5..t8.
+     * The x19 is applied to a 64-bit limb BEFORE widening: doing it as
+     * (u128)19 * a * b forces a 128x64 multiply, which is what made this
+     * 2.4x slower than fiat-crypto's generated code. */
     u64 a0 = a->l0, a1 = a->l1, a2 = a->l2, a3 = a->l3, a4 = a->l4;
     u64 b0 = b->l0, b1 = b->l1, b2 = b->l2, b3 = b->l3, b4 = b->l4;
     unsigned __int128 r0, r1, r2, r3, r4;
     u64 c0, c1, c2, c3, c4;
     u64 rr0, rr1, rr2, rr3, rr4;
+    u64 a1_19 = a1 * 19, a2_19 = a2 * 19, a3_19 = a3 * 19, a4_19 = a4 * 19;
 
     /* r0 = a0*b0 + 19*(a1*b4 + a2*b3 + a3*b2 + a4*b1) */
     r0 = (unsigned __int128)a0 * b0;
-    r0 += (unsigned __int128)19 * a1 * b4;
-    r0 += (unsigned __int128)19 * a2 * b3;
-    r0 += (unsigned __int128)19 * a3 * b2;
-    r0 += (unsigned __int128)19 * a4 * b1;
+    r0 += (unsigned __int128)a1_19 * b4;
+    r0 += (unsigned __int128)a2_19 * b3;
+    r0 += (unsigned __int128)a3_19 * b2;
+    r0 += (unsigned __int128)a4_19 * b1;
 
     /* r1 = a0*b1 + a1*b0 + 19*(a2*b4 + a3*b3 + a4*b2) */
     r1 = (unsigned __int128)a0 * b1;
     r1 += (unsigned __int128)a1 * b0;
-    r1 += (unsigned __int128)19 * a2 * b4;
-    r1 += (unsigned __int128)19 * a3 * b3;
-    r1 += (unsigned __int128)19 * a4 * b2;
+    r1 += (unsigned __int128)a2_19 * b4;
+    r1 += (unsigned __int128)a3_19 * b3;
+    r1 += (unsigned __int128)a4_19 * b2;
 
     /* r2 = a0*b2 + a1*b1 + a2*b0 + 19*(a3*b4 + a4*b3) */
     r2 = (unsigned __int128)a0 * b2;
     r2 += (unsigned __int128)a1 * b1;
     r2 += (unsigned __int128)a2 * b0;
-    r2 += (unsigned __int128)19 * a3 * b4;
-    r2 += (unsigned __int128)19 * a4 * b3;
+    r2 += (unsigned __int128)a3_19 * b4;
+    r2 += (unsigned __int128)a4_19 * b3;
 
     /* r3 = a0*b3 + a1*b2 + a2*b1 + a3*b0 + 19*a4*b4 */
     r3 = (unsigned __int128)a0 * b3;
     r3 += (unsigned __int128)a1 * b2;
     r3 += (unsigned __int128)a2 * b1;
     r3 += (unsigned __int128)a3 * b0;
-    r3 += (unsigned __int128)19 * a4 * b4;
+    r3 += (unsigned __int128)a4_19 * b4;
 
     /* r4 = a0*b4 + a1*b3 + a2*b2 + a3*b1 + a4*b0 */
     r4 = (unsigned __int128)a0 * b4;
@@ -179,8 +183,59 @@ static void fe_mul(Fe* h, Fe const* a, Fe const* b) {
     h->l4 = (rr4 & M51) + (rr3 >> 51);
 }
 
+/* Dedicated squaring: 15 products instead of 25. */
 static void fe_sq(Fe* h, Fe const* a) {
-    fe_mul(h, a, a);
+    u64 a0 = a->l0, a1 = a->l1, a2 = a->l2, a3 = a->l3, a4 = a->l4;
+    unsigned __int128 r0, r1, r2, r3, r4;
+    u64 c0, c1, c2, c3, c4;
+    u64 rr0, rr1, rr2, rr3, rr4;
+    /* Doublings and x19/x38 fold factors, all in 64 bits. */
+    u64 a0_2 = a0 * 2, a1_2 = a1 * 2;
+    u64 a1_38 = a1 * 38, a2_38 = a2 * 38, a3_38 = a3 * 38;
+    u64 a3_19 = a3 * 19, a4_19 = a4 * 19;
+
+    /* r0 = a0² + 38*(a1a4 + a2a3) */
+    r0 = (unsigned __int128)a0 * a0;
+    r0 += (unsigned __int128)a1_38 * a4;
+    r0 += (unsigned __int128)a2_38 * a3;
+
+    /* r1 = 2a0a1 + 38a2a4 + 19a3² */
+    r1 = (unsigned __int128)a0_2 * a1;
+    r1 += (unsigned __int128)a2_38 * a4;
+    r1 += (unsigned __int128)a3_19 * a3;
+
+    /* r2 = 2a0a2 + a1² + 38a3a4 */
+    r2 = (unsigned __int128)a0_2 * a2;
+    r2 += (unsigned __int128)a1 * a1;
+    r2 += (unsigned __int128)a3_38 * a4;
+
+    /* r3 = 2a0a3 + 2a1a2 + 19a4² */
+    r3 = (unsigned __int128)a0_2 * a3;
+    r3 += (unsigned __int128)a1_2 * a2;
+    r3 += (unsigned __int128)a4_19 * a4;
+
+    /* r4 = 2a0a4 + 2a1a3 + a2² */
+    r4 = (unsigned __int128)a0_2 * a4;
+    r4 += (unsigned __int128)a1_2 * a3;
+    r4 += (unsigned __int128)a2 * a2;
+
+    c0 = (u64)(r0 >> 51);
+    c1 = (u64)(r1 >> 51);
+    c2 = (u64)(r2 >> 51);
+    c3 = (u64)(r3 >> 51);
+    c4 = (u64)(r4 >> 51);
+
+    rr0 = (u64)(r0 & M51) + c4 * 19;
+    rr1 = (u64)(r1 & M51) + c0;
+    rr2 = (u64)(r2 & M51) + c1;
+    rr3 = (u64)(r3 & M51) + c2;
+    rr4 = (u64)(r4 & M51) + c3;
+
+    h->l0 = (rr0 & M51) + (rr4 >> 51) * 19;
+    h->l1 = (rr1 & M51) + (rr0 >> 51);
+    h->l2 = (rr2 & M51) + (rr1 >> 51);
+    h->l3 = (rr3 & M51) + (rr2 >> 51);
+    h->l4 = (rr4 & M51) + (rr3 >> 51);
 }
 
 /* h = a * 121666 (constant multiplier). */
