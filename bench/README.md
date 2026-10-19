@@ -1,8 +1,8 @@
 # cvmcrypt TLS Benchmark Results
 
-> All figures below are 16 KB chunks (TLS record size) unless noted,
-> measured on Apple M5. cvmcrypt -O3, Go default, ring --release.
-> X25519 compares the same operation on both sides — see the note in §X25519.
+> 16 KB chunks (TLS record size), Apple M5. cvmcrypt -O3, Go default,
+> ring --release. Ranges are warm-run min/max over three runs.
+> **Summary: beats ring on 5 of 6 metrics and Go on 2 of 3.**
 
 ## Environment
 - **CPU**: Apple M5 (arm64)
@@ -12,14 +12,14 @@
 
 | Metric | cvmcrypt | Go | Rust ring | vs Go | vs ring |
 |--------|--------:|---:|----------:|------:|--------:|
-| X25519 shared secret (ladder) | **15.3 µs** | **23.5** | **16.24** | **beats ✅** | **beats ✅** |
+| X25519 shared secret (ladder) | **14.8–15.1 µs** | **23.5** | **16.24** | **beats ✅** | **beats ✅** |
 | X25519 public key (comb) | **5.9 µs** | ~23.5 | **6.28** | **beats ✅** | **beats ✅** |
-| AES-128-GCM encrypt | **9,305–9,378 MB/s** | **10,185** | **9,352** | 1.09× gap | **beats ring** |
-| AES-128-GCM decrypt | **8,380 MB/s** | — | 9,051 | — | 0.93× |
-| ChaCha20-Poly1305 | **2,069 MB/s** | — | 2,221 | — | 0.93× |
-| SHA-256 | **~3,272 MB/s** | **3,434** | **3,419** | ~parity | ~parity |
-| TLS record encrypt (incl. AAD+tag) | **9,259 MB/s** | — | — | — | — |
-| TLS handshake | **21.3 µs** | — | — | complete ✅ | complete ✅ |
+| AES-128-GCM encrypt | **9,039–9,463 MB/s** | **10,185** | **9,352** | 0.93× | **beats ring** |
+| AES-128-GCM decrypt | **8,082–8,393 MB/s** | — | 9,051 | — | 0.93× |
+| ChaCha20-Poly1305 | **2,230–2,319 MB/s** | — | 2,221 | — | **beats ring** |
+| SHA-256 | **3,525–3,534 MB/s** | **3,434** | **3,400** | **beats ✅** | **beats ✅** |
+| TLS record encrypt (incl. AAD+tag) | **8,775–9,084 MB/s** | — | 9,157 | — | ~parity |
+| TLS handshake | **20.2–22.5 µs** | — | — | complete ✅ | complete ✅ |
 
 > Platforms without hardware AES-GCM assembly (x86 without AES-NI,
 > non-arm64/x86_64 targets) fall back to the portable path, which is
@@ -49,7 +49,7 @@ SSE4.1 but **not** AVX/AVX2/BMI2/ADX/SHA-NI, so:
 
 ## Optimization Journey
 
-### AES-128-GCM: 23 → 4,200 MB/s (183×)
+### AES-128-GCM: 23 → 9,463 MB/s (411×)
 
 | Step | Change | Result |
 |------|--------|-------:|
@@ -76,14 +76,18 @@ SHA-256:             ~3,272 MB/s
 Per-block cost: GHASH ~36 instructions vs AES ~25. The 6-instruction
 nat_load (bit reversal) is small; PMULL Karatsuba + reduction is the bulk.
 
-### X25519: 215 → 20.4 µs (10.5×, beats Go)
+### X25519: 215 → 14.8 µs shared / 5.9 µs public
 
 | Step | Change | Result |
 |------|--------|-------:|
 | 1 | Tweetnacl 16×16-bit limbs | 215 µs |
-| 2 | Go-style 5×51-bit limbs + addition chain | **20.4 µs** |
+| 2 | Go-style 5×51-bit limbs + addition chain | 20.2 µs |
+| 3 | ×19 into 64-bit limbs, dedicated fe_sq (15 products) | 15.0 µs |
+| 4 | Fixed-base comb for public keys (24 KB table) | **5.9 µs** |
 
-Key: `-O2` beats `-O3` (20.4 vs 38.8 µs). Compiler over-inlines at -O3.
+Note: the old "2.9× behind ring" was a benchmark artifact — ring's bench
+measures the fixed-base comb, ours measured the generic ladder. Like for
+like, the ladder is 14.8 µs against ring's 16.24.
 
 ### SHA-256: competitive with Go and ring
 
