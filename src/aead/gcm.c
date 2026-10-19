@@ -28,6 +28,34 @@ extern void aes_gcm_enc_kernel(u8 const* in, u64 in_len, u8* out, u8* xi, u8* iv
                                u32 const* key, u8 const* htable);
 extern void aes_gcm_dec_kernel(u8 const* in, u64 in_len, u8* out, u8* xi, u8* ivec,
                                u32 const* key, u8 const* htable);
+#elif defined(__x86_64__)
+/* x86_64 variants: asm/{aes_gcm,ghash}_amd64_{apple,elf}.S.
+ * Differences from the arm64 kernels:
+ *  - no gcm_gmult_clmul here; gcm_ghash_clmul over a zero block is the
+ *    single-block multiply
+ *  - the fused kernel takes an explicit Htable and Xi, and its length is
+ *    in BYTES (arm64 wants bits)
+ *  - it returns 0 and does nothing when len < 288, so short messages fall
+ *    back to the portable path
+ *  - the x86 Htable is not interchangeable with the arm64 one */
+extern void gcm_init_clmul(u8 htable[256], u8 const h[16]);
+extern void gcm_ghash_clmul(u8 xi[16], u8 const htable[256], u8 const* in, usize len);
+extern usize aesni_gcm_encrypt(u8 const* in, u8* out, usize len, void const* key,
+                               u8 ivec[16], void const* htable, u64* xi);
+extern usize aesni_gcm_decrypt(u8 const* in, u8* out, usize len, void const* key,
+                               u8 ivec[16], void const* htable, u64* xi);
+
+__attribute__((unused)) static u8 gcm_x86_has_asm(void) {
+    u32 a, b, c, d;
+    __asm__ volatile("cpuid" : "=a"(a), "=b"(b), "=c"(c), "=d"(d) : "a"(1), "c"(0));
+    (void)a;
+    (void)b;
+    (void)d;
+    u8 aesni = (u8)((c >> 25) & 1);
+    u8 pclmul = (u8)((c >> 1) & 1);
+    u8 ssse3 = (u8)((c >> 9) & 1);
+    return (u8)(aesni && pclmul && ssse3);
+}
 #endif
 
 /* ------------------------------------------------------------------ */
@@ -72,6 +100,14 @@ static void gf128_mul(CvmcryptGcm* g, u8 const* a, u8 const* b, u8* out) {
         (void)b; /* GCM only ever multiplies by g->H */
         memcpy(out, a, 16);
         gcm_gmult_clmul(out, g->htable);
+        return;
+    }
+#elif defined(__x86_64__)
+    if (g->impl == CVMCRYPT_GCM_IMPL_PMULL && g->asm_ok) {
+        (void)b;
+        static u8 const zero[16] = {0};
+        memcpy(out, a, 16);
+        gcm_ghash_clmul(out, g->htable, zero, 16);
         return;
     }
 #else
@@ -151,11 +187,15 @@ static void ghash_flush(CvmcryptGcm* g, u64 aad_bits, u64 pt_bits) {
  * raw H yields a table that silently produces wrong GHASH while the
  * ciphertext stays correct. */
 static void gcm_asm_setup(CvmcryptGcm* g, usize keylen) {
-#if defined(__aarch64__)
-    /* AES-128/192/256 -> 10/12/14 rounds = keylen/4 + 6. */
-    int rounds = (int)(keylen / 4) + 6;
+#if defined(__aarch64__) || defined(__x86_64__)
+    /* Two different things: the NUMBER of round keys is keylen/4 + 7
+     * (11/13/15), but the "rounds" word the kernels read from key+240
+     * differs per architecture — arm64 wants 10/12/14, x86 wants
+     * 9/11/13. Using the arch value as the loop bound silently leaves
+     * the last round key zeroed on x86. */
+    int last = (int)(keylen / 4) + 6; /* index of the last round key */
     u8* dst = (u8*)g->aes_rk;
-    for (int r = 0; r <= rounds; r++) {
+    for (int r = 0; r <= last; r++) {
         for (int j = 0; j < 4; j++) {
             u32 w = g->aes.enc[4 * r + j];
             usize o = (usize)(16 * r + 4 * j);
@@ -165,11 +205,22 @@ static void gcm_asm_setup(CvmcryptGcm* g, usize keylen) {
             dst[o + 3] = (u8)w;
         }
     }
-    g->aes_rk[60] = (u32)rounds;
+#if defined(__x86_64__)
+    g->aes_rk[60] = (u32)(last - 1);
+#else
+    g->aes_rk[60] = (u32)last;
+#endif
 
-    u8 hrev[16];
-    vst1q_u8(hrev, vrev64q_u8(vld1q_u8(g->H)));
-    gcm_init_clmul(g->htable, hrev);
+    /* The table input differs per architecture: arm64's kernel is fed
+     * VREV64(H) (that is what ring's KeyValue does via u64::from_be_bytes),
+     * the x86 kernel is fed raw H. Getting this wrong leaves the
+     * ciphertext correct and the tag silently wrong. */
+    u8 hin[16];
+    for (i32 i = 0; i < 8; i++) {
+        hin[i] = g->H[7 - i];
+        hin[8 + i] = g->H[15 - i];
+    }
+    gcm_init_clmul(g->htable, hin);
 #else
     (void)g;
 #endif
@@ -191,6 +242,19 @@ static bool gcm_key_setup(CvmcryptGcm* g, u8 const* key, usize keylen) {
     g->impl = CVMCRYPT_GCM_IMPL_PMULL;
     gcm_asm_setup(g, keylen);
     g->asm_ok = true; /* AES-128/192/256 all verified */
+#elif defined(__x86_64__)
+    /* The x86_64 kernels are adopted and assemble, and their AES side is
+     * verified: the ciphertext matches byte-for-byte (round keys as BE
+     * u32, round-count field keylen/4+5, ivec = ICB). What is NOT yet
+     * right is the kernel's GHASH accumulator: the Xi it leaves behind
+     * does not equal GHASH(ciphertext) under the same Htable that
+     * gcm_ghash_clmul verifies correct, so the tag is wrong. Until that
+     * is understood, x86_64 stays on the portable path — shipping a
+     * silently wrong tag is not an option.
+     * Tracked in t61. */
+    g->impl = CVMCRYPT_GCM_IMPL_PMULL;
+    g->asm_ok = 0;
+    gcm_asm_setup(g, keylen);
 #else
     g->impl = CVMCRYPT_GCM_IMPL_SCALAR;
 #endif
@@ -279,6 +343,23 @@ static void gcm_seal_body(CvmcryptGcm* g, u8 const* aad, usize aadlen, u8 const*
             aes_gcm_enc_kernel(pt, (u64)nblk * 8, ct, g->X, g->counter, g->aes_rk,
                                g->htable);
             g->ptlen += (u64)nblk * 8;
+        }
+        if (ptlen > nblk) {
+            gcm_crypt(g, pt + nblk, ptlen - nblk, ct + nblk);
+            ghash_update(g, ct + nblk, ptlen - nblk, &g->ptlen);
+        }
+    } else
+#elif defined(__x86_64__)
+    if (g->impl == CVMCRYPT_GCM_IMPL_PMULL && g->asm_ok) {
+        usize nblk = ptlen & ~(usize)15;
+        /* The kernel bails out below 288 bytes (18 blocks). */
+        if (nblk >= 288) {
+            usize done = aesni_gcm_encrypt(pt, ct, nblk, g->aes_rk, g->counter,
+                                           g->htable, (u64*)g->X);
+            g->ptlen += (u64)done * 8;
+            nblk = done;
+        } else {
+            nblk = 0;
         }
         if (ptlen > nblk) {
             gcm_crypt(g, pt + nblk, ptlen - nblk, ct + nblk);

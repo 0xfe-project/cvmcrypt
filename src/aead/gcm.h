@@ -25,14 +25,17 @@ typedef struct CvmcryptGcm {
     u8 H[16];
     /* Running GHASH accumulator. */
     u8 X[16];
-#if defined(__aarch64__)
-    /* BoringSSL/OpenSSL aesv8-gcm layout, built once at setup: round keys
-     * as big-endian u32 at +0.., round count (u32) at byte 240. `aes.c`
-     * stays clean; only this side buffer knows the adopted asm's layout. */
+#if defined(__aarch64__) || defined(__x86_64__)
+    /* BoringSSL/OpenSSL aes-gcm key layout, built once at setup: round
+     * keys as big-endian u32 at +0.., round count (u32) at byte 240.
+     * Identical on arm64 and x86_64, so one side buffer serves both.
+     * `aes.c` stays clean; only this side buffer knows the layout. */
     u32 aes_rk[61];
-    /* GHASH table from gcm_init_clmul (built from VREV64(H)). */
+    /* GHASH table from gcm_init_clmul (built from VREV64(H)).
+     * The arm64 and x86_64 tables are NOT interchangeable. */
     u8 htable[256];
-    /* Non-zero when the adopted assembly kernel may be used. */
+    /* Non-zero when the adopted assembly kernel may be used (arm64:
+     * always; x86_64: AES-NI + PCLMUL + SSSE3 present). */
     u8 asm_ok;
 #endif
     /* The counter block: J0 padded to 16 bytes. */
@@ -50,7 +53,8 @@ typedef struct CvmcryptGcm {
 
 enum {
     CVMCRYPT_GCM_IMPL_SCALAR = 0,
-    CVMCRYPT_GCM_IMPL_PMULL = 1, /* aarch64 polynomial multiply */
+    /* Hardware path: arm64 PMULL, or x86_64 AES-NI + PCLMULQDQ. */
+    CVMCRYPT_GCM_IMPL_PMULL = 1,
 };
 
 /* ------------------------------------------------------------------ */
