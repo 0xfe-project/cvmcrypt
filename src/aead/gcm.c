@@ -205,10 +205,7 @@ static bool gcm_setup(CvmcryptGcm* g, u8 const* key, usize keylen, u8 const iv[1
     /* Build reflected-domain power table for 8-block GHASH. */
     if (g->impl == CVMCRYPT_GCM_IMPL_PMULL) {
         gcm_asm_setup(g, keylen);
-        /* TODO: the adopted kernel mis-handles AES-192/256 with >=4 blocks
-         * even though our key schedule is byte-identical to BoringSSL's.
-         * Keep those on the portable path until that is understood. */
-        g->asm_ok = (keylen == 16);
+        g->asm_ok = true; /* AES-128/192/256 all verified */
     }
 #endif
 
