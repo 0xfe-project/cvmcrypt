@@ -11,6 +11,7 @@ package main
 import (
 	"crypto/aes"
 	"crypto/cipher"
+	"crypto/ecdh"
 	"crypto/rand"
 	"crypto/sha256"
 	"fmt"
@@ -66,6 +67,40 @@ func benchSHA256(data []byte) {
 }
 
 func benchX25519() {
+	// crypto/ecdh exposes X25519 as a curve: GenerateKey makes a keypair,
+	// ECDH derives the shared secret. Same two operations cvmcrypt reports.
+	const iters = 200
+	alice, err := ecdh.X25519().GenerateKey(rand.Reader)
+	if err != nil {
+		panic(err)
+	}
+	bob, err := ecdh.X25519().GenerateKey(rand.Reader)
+	if err != nil {
+		panic(err)
+	}
+	bobPub := bob.PublicKey()
+
+	start := time.Now()
+	for i := 0; i < iters; i++ {
+		if _, err := alice.ECDH(bobPub); err != nil {
+			panic(err)
+		}
+	}
+	shared := time.Since(start) / iters
+
+	start = time.Now()
+	for i := 0; i < iters; i++ {
+		if _, err := ecdh.X25519().GenerateKey(rand.Reader); err != nil {
+			panic(err)
+		}
+	}
+	pub := time.Since(start) / iters
+
+	fmt.Printf("X25519 shared secret:  %.1f µs/op\n", float64(shared.Nanoseconds())/1000)
+	fmt.Printf("X25519 public key:     %.1f µs/op (GenerateKey, includes keygen)\n",
+		float64(pub.Nanoseconds())/1000)
+	return
+
 	// Go's crypto/ecdh doesn't expose X25519 directly in older versions.
 	// Use curve25519 from x/crypto if available, otherwise skip.
 	fmt.Printf("X25519 key exchange:  (see Go crypto/ecdh, uses crypto/tls internally)\n")

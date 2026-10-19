@@ -1,3 +1,8 @@
 build/
 node_modules/
 bench/target/
+
+# bench binaries are build artifacts
+bench/bench_cvm
+bench/bench_go
+bench/bench_rust
