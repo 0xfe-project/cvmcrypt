@@ -81,6 +81,10 @@ struct CvmTls {
 
     /* Verify certificate callback data (from ctx). */
     void* verify_data;
+
+    /* Opaque owner pointer. QUIC backends keep their connection reference
+     * here so the traffic key callback can find the connection it belongs to. */
+    void* app_data;
 };
 
 #endif /* CVMCRYPT_TLS_CONN_H */

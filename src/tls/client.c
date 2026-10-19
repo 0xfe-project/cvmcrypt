@@ -849,6 +849,15 @@ bool cvm_tls_is_quic(CvmTls const* tls) {
     return tls != NULL && tls->quic;
 }
 
+void cvm_tls_set_app_data(CvmTls* tls, void* data) {
+    if (tls != NULL)
+        tls->app_data = data;
+}
+
+void* cvm_tls_get_app_data(CvmTls const* tls) {
+    return tls != NULL ? tls->app_data : NULL;
+}
+
 int cvm_tls_handle_message(CvmTls* tls, CvmTlsBuf* sendbuf, usize epoch_offsets[5],
                            usize in_epoch, void const* input, usize inlen,
                            CvmTlsHandshakeProps* props) {

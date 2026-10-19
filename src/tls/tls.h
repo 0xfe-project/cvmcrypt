@@ -447,6 +447,14 @@ CvmTlsVec cvm_tls_quic_remote_transport_params(CvmTls const* tls);
 /* True once the session has run in QUIC mode (no record layer). */
 bool cvm_tls_is_quic(CvmTls const* tls);
 
+/*
+ * An opaque pointer owned by the embedder. Nothing in this library reads it.
+ * A QUIC backend stores its connection reference here, because the traffic
+ * key callback is handed the CvmTls and nothing else.
+ */
+void cvm_tls_set_app_data(CvmTls* tls, void* data);
+void* cvm_tls_get_app_data(CvmTls const* tls);
+
 /* QUIC transport mode: get/set handshake messages without record layer. */
 int cvm_tls_handle_message(CvmTls* tls, CvmTlsBuf* sendbuf, usize epoch_offsets[5],
                            usize in_epoch, void const* input, usize inlen,
