@@ -14,9 +14,10 @@
 |--------|--------:|---:|----------:|------:|--------:|
 | X25519 shared secret (ladder) | **15.3 µs** | **23.5** | **16.24** | **beats ✅** | **beats ✅** |
 | X25519 public key (comb) | **5.9 µs** | ~23.5 | **6.28** | **beats ✅** | **beats ✅** |
-| AES-128-GCM | **9,305–9,378 MB/s** | **10,185** | **9,352** | 1.09× gap | **beats ring** |
+| AES-128-GCM encrypt | **9,305–9,378 MB/s** | **10,185** | **9,352** | 1.09× gap | **beats ring** |
+| AES-128-GCM decrypt | **8,380 MB/s** | — | 9,051 | — | 0.93× |
+| ChaCha20-Poly1305 | **2,069 MB/s** | — | 2,221 | — | 0.93× |
 | SHA-256 | **~3,272 MB/s** | **3,434** | **3,419** | ~parity | ~parity |
-| AES-GCM decrypt | **8,400 MB/s** | — | — | — | — |
 | TLS record encrypt (incl. AAD+tag) | **9,259 MB/s** | — | — | — | — |
 | TLS handshake | **21.3 µs** | — | — | complete ✅ | complete ✅ |
 
@@ -24,6 +25,27 @@
 > non-arm64/x86_64 targets) fall back to the portable path, which is
 > currently **10 MB/s** — the portable GHASH is bit-by-bit scalar. That is
 > a known limitation, tracked separately.
+
+## What hardware paths exist, and what is verified where
+
+| primitive | arm64 | x86_64 |
+|---|---|---|
+| AES-GCM | `aesv8-gcm` kernel | `aesni-gcm` kernel (needs AES-NI+PCLMUL+AVX) |
+| ChaCha20-Poly1305 | `chacha20_poly1305` kernel | `_sse41` and `_avx2` kernels |
+| X25519 shared secret | 5×51 C + NEON (15.3 µs) | 5×51 C (no ADX path yet) |
+| X25519 public key | fixed-base comb (5.9 µs) | fixed-base comb |
+| AES block | NEON | AES-NI |
+| SHA-256 | `vsha256hq` | portable (no SHA-NI path) |
+
+Verification: arm64 is the development machine, so every path is measured
+and tested there. On x86_64, Rosetta reports AES-NI, PCLMUL, SSSE3 and
+SSE4.1 but **not** AVX/AVX2/BMI2/ADX/SHA-NI, so:
+- the ChaChaPoly SSE4.1 kernel and the AES-NI block path run and are
+  verified locally (byte-identical output to arm64);
+- the AES-GCM kernel, the ChaChaPoly AVX2 kernel, the X25519 ADX path and
+  any SHA-NI path cannot be exercised locally at all. The AES-GCM one is
+  verified through `CVMCRYPT_GCM_FORCE_ASM`; the X25519 ADX path is not
+  written yet precisely because it could not be verified.
 
 ## Optimization Journey
 
