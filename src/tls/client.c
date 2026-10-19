@@ -10,8 +10,13 @@
  */
 
 #include "tls/tls_conn.h"
+
+#include "asn1/der.h"
 #include "base/mem.h"
 #include "base/secure.h"
+#include "cvmcrypt/hash.h"
+#include "tls/handshake.h"
+#include "x509/x509.h"
 
 extern void* rt_mem_alloc(usize bytes);
 extern void rt_mem_free(void* p);
@@ -361,6 +366,117 @@ static int client_handle_server_hello(CvmTls* tls, CvmTlsBuf* sendbuf,
 }
 
 /* ------------------------------------------------------------------ */
+/* client: verify the server's CertificateVerify                        */
+/* ------------------------------------------------------------------ */
+
+/*
+ * RFC 8446 §4.4.3. The signature covers
+ *
+ *     0x20 x 64 || "TLS 1.3, server CertificateVerify" || 0x00 ||
+ *     Transcript-Hash(ClientHello..Certificate)
+ *
+ * and is checked against the leaf certificate's public key with the scheme
+ * named in the message. Unsupported schemes fail closed: an unknown algorithm
+ * must never mean "accept".
+ */
+static int verify_certificate_verify(CvmTls* tls, CvmTlsCertVerify const* cv) {
+    CvmX509Cert cert;
+    u8 transcript[TLS_MAX_DIGEST_SIZE];
+    u8 content[256];
+    u8 digest[TLS_MAX_DIGEST_SIZE];
+    usize content_len = 0;
+    usize digest_len = 0;
+    CvmcryptMdAlg const* md = NULL;
+    int ret = TLS_ALERT_DECRYPT_ERROR;
+    bool ok = false;
+
+    if (tls->peer_leaf_cert_len == 0)
+        return TLS_ALERT_BAD_CERTIFICATE;
+    if (tls->ks.hash_ctx == NULL)
+        return TLS_ALERT_INTERNAL_ERROR;
+
+    cvmcrypt_x509_init(&cert);
+    if (cvmcrypt_x509_parse(&cert, tls->peer_leaf_cert, tls->peer_leaf_cert_len) !=
+        X509_OK) {
+        cvmcrypt_x509_free(&cert);
+        return TLS_ALERT_BAD_CERTIFICATE;
+    }
+
+    /* The transcript must end at Certificate: this branch runs before the
+     * CertificateVerify message is hashed. */
+    tls->ks.hash_ctx->final(tls->ks.hash_ctx, transcript, TLS_HASH_FINAL_SNAPSHOT);
+
+    if (cvm_tls_build_cert_verify_data(content, sizeof(content), &content_len,
+                                       "TLS 1.3, server CertificateVerify", transcript,
+                                       tls->suite->hash->digest_size) != 0) {
+        cvmcrypt_x509_free(&cert);
+        return TLS_ALERT_INTERNAL_ERROR;
+    }
+
+    switch (cv->algorithm) {
+    case TLS_SIGNATURE_ECDSA_SECP256R1_SHA256:
+        md = &cvmcrypt_md_sha256;
+        break;
+    case TLS_SIGNATURE_ECDSA_SECP384R1_SHA384:
+    case TLS_SIGNATURE_RSA_PSS_RSAE_SHA384:
+        md = &cvmcrypt_md_sha384;
+        break;
+    case TLS_SIGNATURE_RSA_PSS_RSAE_SHA256:
+    case TLS_SIGNATURE_RSA_PKCS1_SHA256:
+        md = &cvmcrypt_md_sha256;
+        break;
+    default:
+        /* Unsupported scheme: refuse rather than guess. */
+        cvmcrypt_x509_free(&cert);
+        return TLS_ALERT_ILLEGAL_PARAMETER;
+    }
+
+    digest_len = cvmcrypt_md_digest_size(md);
+    if (!cvmcrypt_md_digest(md, content, content_len, digest)) {
+        cvmcrypt_x509_free(&cert);
+        return TLS_ALERT_INTERNAL_ERROR;
+    }
+
+    if (cv->algorithm == TLS_SIGNATURE_ECDSA_SECP256R1_SHA256 ||
+        cv->algorithm == TLS_SIGNATURE_ECDSA_SECP384R1_SHA384) {
+        /* ECDSA-Sig-Value ::= SEQUENCE { r INTEGER, s INTEGER } */
+        DerCursor outer = der_cursor_init(cv->signature.base, cv->signature.len);
+        DerCursor seq, r, s;
+        if (cert.pk_type == X509_PK_EC && der_read_tlv(&outer, 0x30, &seq) == DER_OK &&
+            der_read_tlv(&seq, 0x02, &r) == DER_OK &&
+            der_read_tlv(&seq, 0x02, &s) == DER_OK) {
+            ok = cvmcrypt_ecdsa_verify(&cert.ec_key, digest, digest_len, r.p,
+                                       r.remaining, s.p, s.remaining);
+        }
+    } else {
+        CvmRsaHashId const hid =
+            (cv->algorithm == TLS_SIGNATURE_RSA_PKCS1_SHA256)
+                ? CVMCRYPT_RSA_HASH_SHA256
+                : (cv->algorithm == TLS_SIGNATURE_RSA_PSS_RSAE_SHA384
+                       ? CVMCRYPT_RSA_HASH_SHA384
+                       : CVMCRYPT_RSA_HASH_SHA256);
+        if (cert.pk_type == X509_PK_RSA) {
+            if (cv->algorithm == TLS_SIGNATURE_RSA_PKCS1_SHA256) {
+                ok = cvmcrypt_rsa_verify_pkcs1_v15(&cert.rsa_key, hid, digest,
+                                                   digest_len, cv->signature.base,
+                                                   cv->signature.len);
+            } else {
+                ok = cvmcrypt_rsa_verify_pss(&cert.rsa_key, hid, digest, digest_len,
+                                             cv->signature.base, cv->signature.len);
+            }
+        }
+    }
+
+    if (ok)
+        ret = 0;
+
+    memset(digest, 0, sizeof(digest));
+    memset(transcript, 0, sizeof(transcript));
+    cvmcrypt_x509_free(&cert);
+    return ret;
+}
+
+/* ------------------------------------------------------------------ */
 /* client: handle each handshake message                                */
 /* ------------------------------------------------------------------ */
 
@@ -412,6 +528,15 @@ static int client_handle_message(CvmTls* tls, CvmTlsBuf* sendbuf, CvmTlsVec mess
                 tls->num_certs = cert.num_entries;
                 for (usize i = 0; i < cert.num_entries && i < 4; i++)
                     tls->certs[i] = cert.entries[i];
+
+                /* Copy the leaf out of the record buffer before it is freed. */
+                tls->peer_leaf_cert_len = 0;
+                if (cert.num_entries > 0 &&
+                    cert.entries[0].data.len <= sizeof(tls->peer_leaf_cert)) {
+                    memcpy(tls->peer_leaf_cert, cert.entries[0].data.base,
+                           cert.entries[0].data.len);
+                    tls->peer_leaf_cert_len = cert.entries[0].data.len;
+                }
                 tls->state = TLS_STATE_CLIENT_EXPECT_CERTIFICATE_VERIFY;
             }
         } else if (type == TLS_HANDSHAKE_TYPE_CERTIFICATE_REQUEST) {
@@ -427,10 +552,10 @@ static int client_handle_message(CvmTls* tls, CvmTlsBuf* sendbuf, CvmTlsVec mess
             CvmTlsCertVerify cv;
             ret = cvm_tls_decode_certificate_verify(&cv, message.base + 4,
                                                     message.base + message.len);
-            if (ret == 0) {
-                /* TODO: verify signature against server cert (t46). */
+            if (ret == 0)
+                ret = verify_certificate_verify(tls, &cv);
+            if (ret == 0)
                 tls->state = TLS_STATE_CLIENT_EXPECT_FINISHED;
-            }
         } else {
             ret = TLS_ALERT_UNEXPECTED_MESSAGE;
         }

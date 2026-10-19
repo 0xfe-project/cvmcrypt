@@ -67,9 +67,15 @@ struct CvmTls {
     u8 remote_quic_params[TLS_MAX_QUIC_PARAMS_SIZE];
     usize remote_quic_params_len;
 
-    /* Received server certificate (DER). */
+    /* Received server certificate chain. The CvmTlsVec entries borrow the
+     * decrypted record buffer, which is freed when the record is done — so
+     * the leaf is COPIED here while it is still valid. CertificateVerify
+     * usually arrives in a later record, and verifying against a dangling
+     * pointer is the kind of bug that works until the allocator moves. */
     CvmTlsCertEntry certs[4];
     usize num_certs;
+    u8 peer_leaf_cert[TLS_MAX_LEAF_CERT_SIZE];
+    usize peer_leaf_cert_len;
 
     /* Legacy session ID for middlebox compat. */
     u8 legacy_session_id[32];

@@ -83,6 +83,10 @@ typedef struct CvmTlsTrafficProt {
  * encoder produces well under this. */
 #define TLS_MAX_QUIC_PARAMS_SIZE 512
 
+/* Leaf certificates are a few KB at most; anything larger is refused rather
+ * than truncated. */
+#define TLS_MAX_LEAF_CERT_SIZE 4096
+
 CVM_INLINE void tls_build_aad(u8 aad[5], usize reclen) {
     aad[0] = TLS_CONTENT_TYPE_APPDATA;
     aad[1] = 3;
