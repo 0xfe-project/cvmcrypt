@@ -12,11 +12,11 @@
 
 | Metric | cvmcrypt | Go | Rust ring | vs Go | vs ring |
 |--------|--------:|---:|----------:|------:|--------:|
-| X25519 (general point) | **15.0 µs** | **23.5** | **16.24** | **beats ✅** | **beats ✅** |
-| X25519 (fixed-base, public key) | 15.0 µs | ~23.5 | **6.28** | — | 2.4× gap |
+| X25519 shared secret (ladder) | **15.3 µs** | **23.5** | **16.24** | **beats ✅** | **beats ✅** |
+| X25519 public key (comb) | **5.9 µs** | ~23.5 | **6.28** | **beats ✅** | **beats ✅** |
 | AES-128-GCM | **9,305–9,378 MB/s** | **10,185** | **9,352** | 1.09× gap | **beats ring** |
 | SHA-256 | **~3,272 MB/s** | **3,434** | **3,419** | ~parity | ~parity |
-| TLS handshake | **40.7 µs** | — | — | complete ✅ | complete ✅ |
+| TLS handshake | **21.3 µs** | — | — | complete ✅ | complete ✅ |
 
 ## Optimization Journey
 
@@ -83,8 +83,8 @@ Fair comparison, measured with ring 0.17.14 `agree_ephemeral`:
 | Montgomery ladder, general point | **15.0 us** | 16.24 us |
 | fixed-base comb, public key       | 15.0 us (ladder) | **6.28 us** |
 
-So the ladder already beats ring's. What we lack is the comb — tracked
-as the next task; adding it takes the TLS handshake from 30.0 to ~21 us.
+Both halves now beat ring: the ladder at 15.3 us (ring 16.24) and the
+fixed-base comb at 5.9 us (ring 6.28). The handshake is 21.3 us.
 
 ## Remaining Gap Analysis
 
