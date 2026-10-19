@@ -18,6 +18,8 @@
 #include "base/secure.h"
 
 #if defined(__aarch64__)
+#include <arm_neon.h>
+
 /* Adopted from BoringSSL, vendored via ring 0.17.14 pregenerated/.
  * Sources: src/aead/asm/{aes_gcm,ghash}_arm64_{apple,elf}.S */
 extern void gcm_init_clmul(u8 htable[256], u8 const h[16]);
@@ -61,192 +63,9 @@ void gf128_mul_scalar(u8 const* a, u8 const* b, u8* out) {
     memcpy(out, Z, 16);
 }
 
-#if defined(__aarch64__)
-#include <arm_neon.h>
-
-/* ==================================================================
- * Reflected-domain GHASH — exact translation of Go's gcm_arm64.s.
- *
- * Key insight (verified by disassembly): Go's VEXT $8, A, B, D
- * compiles to EXT D, B, A, #8, i.e. D = B[8:15] || A[0:7].
- * The SOURCE OPERANDS ARE REVERSED from ARM64 EXT convention.
- *
- * The reflected domain uses VREV64 (byte swap within each u64,
- * NO half-swap) to transform data. No bit reversal needed at all.
- * ================================================================== */
-
-/* swap64: exchange the two 64-bit lanes */
-__attribute__((target("crypto"))) static inline uint64x2_t swap64(uint64x2_t v) {
-    return vreinterpretq_u64_u8(
-        vextq_u8(vreinterpretq_u8_u64(v), vreinterpretq_u8_u64(v), 8));
-}
-
-/* VREV64: byte swap within each 8-byte group (the data transform) */
-__attribute__((target("crypto"))) static inline uint64x2_t vrev64_ld(u8 const* p) {
-    return vreinterpretq_u64_u8(vrev64q_u8(vld1q_u8(p)));
-}
-
-/* mulRound: accumulate one block's product into (acc0, acc1, accm).
- * t1 = H^i (from table), t2 = H^i ⊕ swap(H^i) (Karatsuba precompute).
- * x must already be VREV64'd and XORed with accumulator. */
-__attribute__((target("crypto"))) static inline void
-mul_round(uint64x2_t x, uint64x2_t t1, uint64x2_t t2, uint64x2_t* acc0,
-          uint64x2_t* acc1, uint64x2_t* accm) {
-    uint64x2_t t0 = veorq_u64(x, swap64(x)); /* Karatsuba mid */
-    *acc1 = veorq_u64(
-        *acc1, vreinterpretq_u64_p128(vmull_p64((poly64_t)vgetq_lane_u64(x, 0),
-                                                (poly64_t)vgetq_lane_u64(t1, 0))));
-    *acc0 = veorq_u64(
-        *acc0, vreinterpretq_u64_p128(vmull_p64((poly64_t)vgetq_lane_u64(x, 1),
-                                                (poly64_t)vgetq_lane_u64(t1, 1))));
-    *accm = veorq_u64(
-        *accm, vreinterpretq_u64_p128(vmull_p64((poly64_t)vgetq_lane_u64(t0, 0),
-                                                (poly64_t)vgetq_lane_u64(t2, 0))));
-}
-
-/* reduce: fold the 256-bit accumulator to 128 bits.
- * Result in acc0. Follows Go's reduce() macro exactly. */
-__attribute__((target("crypto"))) static inline void
-reduce_go(uint64x2_t* acc0_p, uint64x2_t* acc1_p, uint64x2_t accm) {
-    uint64x2_t poly = {0xC200000000000000ULL, 1};
-    uint64x2_t zero = vdupq_n_u64(0);
-    uint64x2_t acc0 = *acc0_p, acc1 = *acc1_p;
-
-    accm = veorq_u64(veorq_u64(accm, acc0), acc1);
-
-    /* VEXT $8, ZERO, ACCM, T0 → T0 = ACCM[8:] || ZERO[:8] = {ACCM_hi, 0} */
-    uint64x2_t t0 = vreinterpretq_u64_u8(
-        vextq_u8(vreinterpretq_u8_u64(accm), vreinterpretq_u8_u64(zero), 8));
-    /* VEXT $8, ACCM, ZERO, ACCM → ACCM = ZERO[8:] || ACCM[:8] = {0, ACCM_lo} */
-    accm = vreinterpretq_u64_u8(
-        vextq_u8(vreinterpretq_u8_u64(zero), vreinterpretq_u8_u64(accm), 8));
-
-    acc0 = veorq_u64(acc0, accm); /* ACC0 ^= {0, ACCM_lo} */
-    acc1 = veorq_u64(acc1, t0);   /* ACC1 ^= {ACCM_hi, 0} */
-
-    t0 = vreinterpretq_u64_p128(vmull_p64((poly64_t)vgetq_lane_u64(poly, 0),
-                                          (poly64_t)vgetq_lane_u64(acc0, 0)));
-    acc0 = veorq_u64(swap64(acc0), t0);
-
-    t0 = vreinterpretq_u64_p128(vmull_p64((poly64_t)vgetq_lane_u64(poly, 0),
-                                          (poly64_t)vgetq_lane_u64(acc0, 0)));
-    acc1 = veorq_u64(acc1, t0);
-
-    acc1 = swap64(acc1); /* IN PLACE — per Go's reduce() */
-    acc0 = veorq_u64(acc0, acc1);
-
-    *acc0_p = acc0;
-    *acc1_p = acc1;
-}
-
-/* Build the reflected-domain power table.
- * entry[7] = {2H, 2H⊕swap(2H)} (initial, NOT swapped first element)
- * entry[6..0] = {swap(P), P⊕swap(P)} (P = next power via P×2H) */
-__attribute__((target("crypto"))) static void ghash_init_refl(CvmcryptGcm* g) {
-    uint64x2_t poly = {0xC200000000000000ULL, 1};
-    uint64x2_t zero = vdupq_n_u64(0);
-
-    /* H_reflected = VREV64(H_be) */
-    uint64x2_t B0 = vrev64_ld(g->H);
-
-    /* Multiply by 2 mod P (reflected domain) — Go's exact sequence */
-    {
-        int64_t low = (int64_t)vgetq_lane_u64(B0, 0);
-        int64_t sign = low >> 63;
-        uint64x2_t T1 = vdupq_n_u64((uint64_t)sign);
-        T1 = vandq_u64(poly, T1);
-        uint64x2_t T2 = vshrq_n_u64(B0, 63);
-        /* VEXT $8, ZERO, T2, T2 → T2 = T2[8:]||ZERO[:8] = {T2_hi, 0} */
-        T2 = vreinterpretq_u64_u8(
-            vextq_u8(vreinterpretq_u8_u64(T2), vreinterpretq_u8_u64(zero), 8));
-        B0 = vshlq_n_u64(B0, 1);
-        B0 = veorq_u64(veorq_u64(B0, T1), T2);
-    }
-    uint64x2_t B1 = veorq_u64(B0, swap64(B0));
-
-    /* Store entry 7 = {2H, 2H⊕swap(2H)} */
-    vst1q_u64((uint64_t*)g->H_refl[7], B0);
-    vst1q_u64((uint64_t*)(g->H_refl[7] + 16), B1);
-
-    /* Loop: compute entries 6 down to 0 */
-    uint64x2_t B2 = B0, B3 = B1;
-    for (int entry = 6; entry >= 0; entry--) {
-        /* new_power = B2 × B0 (Karatsuba via B3 × B1) */
-        uint64x2_t t1 = vreinterpretq_u64_p128(vmull_p64(
-            (poly64_t)vgetq_lane_u64(B2, 0), (poly64_t)vgetq_lane_u64(B0, 0)));
-        uint64x2_t t0 = vreinterpretq_u64_p128(vmull_p64(
-            (poly64_t)vgetq_lane_u64(B2, 1), (poly64_t)vgetq_lane_u64(B0, 1)));
-        uint64x2_t t2 = vreinterpretq_u64_p128(vmull_p64(
-            (poly64_t)vgetq_lane_u64(B3, 0), (poly64_t)vgetq_lane_u64(B1, 0)));
-
-        /* Fold + reduce (initLoop variant: EXTRA swap round) */
-        t2 = veorq_u64(veorq_u64(t2, t0), t1);
-        uint64x2_t t3 = vreinterpretq_u64_u8(
-            vextq_u8(vreinterpretq_u8_u64(t2), vreinterpretq_u8_u64(zero), 8));
-        t2 = vreinterpretq_u64_u8(
-            vextq_u8(vreinterpretq_u8_u64(zero), vreinterpretq_u8_u64(t2), 8));
-        t0 = veorq_u64(t0, t2);
-        t1 = veorq_u64(t1, t3);
-
-        t2 = vreinterpretq_u64_p128(vmull_p64((poly64_t)vgetq_lane_u64(poly, 0),
-                                              (poly64_t)vgetq_lane_u64(t0, 0)));
-        t0 = veorq_u64(swap64(t0), t2);
-
-        t2 = vreinterpretq_u64_p128(vmull_p64((poly64_t)vgetq_lane_u64(poly, 0),
-                                              (poly64_t)vgetq_lane_u64(t0, 0)));
-        t0 = veorq_u64(swap64(t0), t2); /* EXTRA swap round (initLoop) */
-
-        B2 = veorq_u64(t1, t0); /* new power = T1 ⊕ T0 */
-
-        /* Karatsuba precompute: B3 = P ⊕ swap(P), B2 = swap(P) */
-        B3 = B2;
-        B2 = swap64(B2);
-        B3 = veorq_u64(B3, B2);
-
-        vst1q_u64((uint64_t*)g->H_refl[entry], B2);
-        vst1q_u64((uint64_t*)(g->H_refl[entry] + 16), B3);
-    }
-}
-
-/* 8-block aggregated reflected-domain GHASH.
- * 24 PMULLs + 1 reduction per 128 bytes. Zero bit reversal. */
-__attribute__((target("crypto"))) static void ghash_8blocks_refl(CvmcryptGcm* g,
-                                                                 u8 const* data) {
-    uint64x2_t acc0 = vdupq_n_u64(0), acc1 = vdupq_n_u64(0), accm = vdupq_n_u64(0);
-
-    /* First block: XOR with running accumulator */
-    uint64x2_t acc_prev = vld1q_u64((uint64_t const*)g->X_refl);
-    uint64x2_t x0 = veorq_u64(vrev64_ld(data), acc_prev);
-
-    /* Table: entry[0] = highest power (block 1), entry[7] = 2H (block 8). */
-    uint64x2_t t1 = vld1q_u64((uint64_t const*)g->H_refl[0]);
-    uint64x2_t t2 = vld1q_u64((uint64_t const*)(g->H_refl[0] + 16));
-    {
-        uint64x2_t t0 = veorq_u64(x0, swap64(x0));
-        acc1 = vreinterpretq_u64_p128(vmull_p64((poly64_t)vgetq_lane_u64(x0, 0),
-                                                (poly64_t)vgetq_lane_u64(t1, 0)));
-        acc0 = vreinterpretq_u64_p128(vmull_p64((poly64_t)vgetq_lane_u64(x0, 1),
-                                                (poly64_t)vgetq_lane_u64(t1, 1)));
-        accm = vreinterpretq_u64_p128(vmull_p64((poly64_t)vgetq_lane_u64(t0, 0),
-                                                (poly64_t)vgetq_lane_u64(t2, 0)));
-    }
-
-    /* Blocks 2-8: entries 1-7 (decreasing power) */
-    for (int i = 1; i <= 7; i++) {
-        t1 = vld1q_u64((uint64_t const*)g->H_refl[i]);
-        t2 = vld1q_u64((uint64_t const*)(g->H_refl[i] + 16));
-        mul_round(vrev64_ld(data + i * 16), t1, t2, &acc0, &acc1, &accm);
-    }
-
-    reduce_go(&acc0, &acc1, accm);
-    vst1q_u64((uint64_t*)g->X_refl, acc0);
-}
-
-#endif
-
-/* Single-block GHASH multiply (slow path for partial blocks).
- * On aarch64, uses the reflected-domain single-block path;
- * elsewhere, scalar bit-by-bit. */
+/* Single-block GHASH multiply by H. The arm64 path goes through the
+ * adopted BoringSSL gmult (~10 ns); the portable path below is the
+ * reference oracle (bit-by-bit, ~150 ns). */
 static void gf128_mul(CvmcryptGcm* g, u8 const* a, u8 const* b, u8* out) {
 #if defined(__aarch64__)
     if (g->impl == CVMCRYPT_GCM_IMPL_PMULL) {
@@ -278,23 +97,6 @@ static void ghash_update(CvmcryptGcm* g, u8 const* data, usize len, u64* total_b
     /* Absorb data into the GHASH accumulator, buffering partial blocks. */
     *total_bits += len * 8;
 
-#if defined(__aarch64__)
-    /* Fast path: 8-block reflected-domain GHASH (zero bit reversal). */
-    if (g->impl == CVMCRYPT_GCM_IMPL_PMULL && g->buflen == 0 && len >= 128) {
-        /* Enter fast path: sync X_refl from g->X (in case slow path ran). */
-        vst1q_u64((uint64_t*)g->X_refl, vrev64_ld(g->X));
-        usize num8 = len / 128;
-        for (usize i = 0; i < num8; i++) {
-            ghash_8blocks_refl(g, data);
-            data += 128;
-            len -= 128;
-        }
-        /* Exit fast path: sync g->X from X_refl. */
-        vst1q_u8(g->X, vrev64q_u8(vreinterpretq_u8_u64(
-                           vld1q_u64((uint64_t const*)g->X_refl))));
-    }
-#endif
-
     while (len > 0) {
         usize n = 16 - g->buflen;
         if (n > len)
@@ -311,11 +113,6 @@ static void ghash_update(CvmcryptGcm* g, u8 const* data, usize len, u64* total_b
             }
             gf128_mul(g, g->X, g->H, g->X);
             /* Sync reflected accumulator for the fast path. */
-#if defined(__aarch64__)
-            if (g->impl == CVMCRYPT_GCM_IMPL_PMULL) {
-                vst1q_u64((uint64_t*)g->X_refl, vrev64_ld(g->X));
-            }
-#endif
             g->buflen = 0;
         }
     }
@@ -329,11 +126,6 @@ static void ghash_flush(CvmcryptGcm* g, u64 aad_bits, u64 pt_bits) {
             g->X[i] ^= g->buf[i];
         }
         gf128_mul(g, g->X, g->H, g->X);
-#if defined(__aarch64__)
-        if (g->impl == CVMCRYPT_GCM_IMPL_PMULL) {
-            vst1q_u64((uint64_t*)g->X_refl, vrev64_ld(g->X));
-        }
-#endif
         g->buflen = 0;
     }
 
@@ -347,11 +139,6 @@ static void ghash_flush(CvmcryptGcm* g, u64 aad_bits, u64 pt_bits) {
         g->X[i] ^= lenblk[i];
     }
     gf128_mul(g, g->X, g->H, g->X);
-#if defined(__aarch64__)
-    if (g->impl == CVMCRYPT_GCM_IMPL_PMULL) {
-        vst1q_u64((uint64_t*)g->X_refl, vrev64_ld(g->X));
-    }
-#endif
 }
 
 /* ------------------------------------------------------------------ */
@@ -404,7 +191,6 @@ static bool gcm_setup(CvmcryptGcm* g, u8 const* key, usize keylen, u8 const iv[1
 
     /* Reset the accumulator. */
     memset(g->X, 0, 16);
-    memset(g->X_refl, 0, 16);
     g->buflen = 0;
     g->aadlen = 0;
     g->ptlen = 0;
@@ -418,7 +204,6 @@ static bool gcm_setup(CvmcryptGcm* g, u8 const* key, usize keylen, u8 const iv[1
 #if defined(__aarch64__)
     /* Build reflected-domain power table for 8-block GHASH. */
     if (g->impl == CVMCRYPT_GCM_IMPL_PMULL) {
-        ghash_init_refl(g);
         gcm_asm_setup(g, keylen);
         /* TODO: the adopted kernel mis-handles AES-192/256 with >=4 blocks
          * even though our key schedule is byte-identical to BoringSSL's.
@@ -430,173 +215,9 @@ static bool gcm_setup(CvmcryptGcm* g, u8 const* key, usize keylen, u8 const iv[1
     return true;
 }
 
-/* Batched AES-CTR: encrypt 4 blocks in parallel.
- * Pre-computes 4 counters, AES-encrypts them simultaneously (pipelined),
- * then XORs with input. Amortizes counter increment over 4 blocks. */
-__attribute__((target("crypto"))) static void gcm_crypt_4(CvmcryptGcm* g, u8 const* in,
-                                                          u8* out) {
-    /* Load AES round keys. */
-    uint8x16_t rk[11];
-    for (int r = 0; r <= 10; r++) {
-        rk[r] = vrev32q_u8(vld1q_u8((u8 const*)&g->aes.enc[4 * r]));
-    }
-
-    /* Generate 4 counters (ctr, ctr+1, ctr+2, ctr+3). */
-    uint8x16_t c0 = vld1q_u8(g->counter);
-    uint8x16_t c1 = c0, c2 = c0, c3 = c0;
-
-    /* Increment last 32 bits (big-endian) for c1, c2, c3. */
-    /* Use scalar: read last 4 bytes, add 1/2/3, write back. */
-    {
-        u32 be;
-        memcpy(&be, g->counter + 12, 4);
-        be = __builtin_bswap32(be); /* to host order */
-        u32 b1 = __builtin_bswap32(be + 1);
-        u32 b2 = __builtin_bswap32(be + 2);
-        u32 b3 = __builtin_bswap32(be + 3);
-        u32 b4 = __builtin_bswap32(be + 4);
-        memcpy((u8*)&c1 + 12, &b1, 4);
-        memcpy((u8*)&c2 + 12, &b2, 4);
-        memcpy((u8*)&c3 + 12, &b3, 4);
-        memcpy(g->counter + 12, &b4, 4); /* update for next batch */
-    }
-
-    /* AES-encrypt all 4 counters (interleaved for pipeline). */
-    uint8x16_t s0 = c0, s1 = c1, s2 = c2, s3 = c3;
-    for (int r = 0; r < 9; r++) {
-        s0 = vaesmcq_u8(vaeseq_u8(s0, rk[r]));
-        s1 = vaesmcq_u8(vaeseq_u8(s1, rk[r]));
-        s2 = vaesmcq_u8(vaeseq_u8(s2, rk[r]));
-        s3 = vaesmcq_u8(vaeseq_u8(s3, rk[r]));
-    }
-    s0 = veorq_u8(vaeseq_u8(s0, rk[9]), rk[10]);
-    s1 = veorq_u8(vaeseq_u8(s1, rk[9]), rk[10]);
-    s2 = veorq_u8(vaeseq_u8(s2, rk[9]), rk[10]);
-    s3 = veorq_u8(vaeseq_u8(s3, rk[9]), rk[10]);
-
-    /* XOR with input, store output. */
-    uint8x16_t p0 = vld1q_u8(in);
-    uint8x16_t p1 = vld1q_u8(in + 16);
-    uint8x16_t p2 = vld1q_u8(in + 32);
-    uint8x16_t p3 = vld1q_u8(in + 48);
-    vst1q_u8(out, veorq_u8(p0, s0));
-    vst1q_u8(out + 16, veorq_u8(p1, s1));
-    vst1q_u8(out + 32, veorq_u8(p2, s2));
-    vst1q_u8(out + 48, veorq_u8(p3, s3));
-}
-
-#if defined(__aarch64__)
-/* Fused 8-block AES-CTR + GHASH (Go's octetsLoop structure).
- * For each 128-byte chunk: AES-encrypt 8 counters, XOR with input,
- * then immediately GHASH the 8 ciphertext blocks. Data stays in
- * registers/L1 — no second pass over the ciphertext. */
-#if defined(__aarch64__)
-/* Pure-assembly fused AES-GCM kernel (gcm_arm64.S).
- * Processes 64 bytes per iteration, all state in NEON registers. */
-extern void cvmcrypt_gcm_enc_kernel(u32 const* rk, u8 const* in, u8* out, usize nbytes,
-                                    u8 const* tbl_e4, u8 const* ctr, u8* xrefl);
-
-__attribute__((target("crypto"), unused)) static void
-gcm_crypt_hash_asm64(CvmcryptGcm* g, u8 const* in, u8* out, usize nbytes) {
-    cvmcrypt_gcm_enc_kernel(g->aes.enc, in, out, nbytes, &g->H_refl[0][0], g->counter,
-                            g->X_refl);
-}
-#endif
-
-__attribute__((target("crypto"), unused)) static void
-gcm_crypt_hash_loop(CvmcryptGcm* g, u8 const* in, u8* out, usize nbytes) {
-    /* Load AES round keys ONCE — hoisted out of the chunk loop. */
-    uint8x16_t rk[11];
-    for (int r = 0; r <= 10; r++) {
-        rk[r] = vrev32q_u8(vld1q_u8((u8 const*)&g->aes.enc[4 * r]));
-    }
-
-    /* Running GHASH accumulator — stays in a register across iterations. */
-    uint64x2_t acc_run = vld1q_u64((uint64_t const*)g->X_refl);
-
-    while (nbytes >= 128) {
-        nbytes -= 128;
-
-        /* Generate 8 counters via NEON VADD chain (Go's approach).
-         * CTR in native u32; VREV32 converts to/from BE bytes. */
-        uint32x4_t inc = vdupq_n_u32(0);
-        inc = vsetq_lane_u32(1, inc, 3);
-        uint32x4_t cn = vreinterpretq_u32_u8(vrev32q_u8(vld1q_u8(g->counter)));
-        uint32x4_t c[8];
-        c[0] = cn;
-        for (int i = 1; i < 8; i++)
-            c[i] = vaddq_u32(c[i - 1], inc);
-        cn = vaddq_u32(c[7], inc); /* for next iteration */
-        vst1q_u8(g->counter, vrev32q_u8(vreinterpretq_u8_u32(cn)));
-        uint8x16_t ctr[8];
-        for (int i = 0; i < 8; i++)
-            ctr[i] = vrev32q_u8(vreinterpretq_u8_u32(c[i]));
-
-        /* AES-encrypt all 8 counters (interleaved). */
-        uint8x16_t s[8];
-        for (int i = 0; i < 8; i++)
-            s[i] = ctr[i];
-        for (int r = 0; r < 9; r++) {
-            for (int i = 0; i < 8; i++)
-                s[i] = vaesmcq_u8(vaeseq_u8(s[i], rk[r]));
-        }
-        for (int i = 0; i < 8; i++)
-            s[i] = veorq_u8(vaeseq_u8(s[i], rk[9]), rk[10]);
-
-        /* XOR with input, store ciphertext, convert to reflected domain.
-         * REUSE s[] as xb[] — saves 8 NEON registers (no spill). */
-        for (int i = 0; i < 8; i++) {
-            uint8x16_t p = vld1q_u8(in + i * 16);
-            s[i] = veorq_u8(p, s[i]);
-            vst1q_u8(out + i * 16, s[i]);
-            s[i] = vrev64q_u8(s[i]); /* now holds reflected ciphertext */
-        }
-
-        /* GHASH 8 blocks (reflected domain).
-         * Accumulator stays in a register across iterations. */
-        uint64x2_t acc0 = vdupq_n_u64(0), acc1 = vdupq_n_u64(0), accm = vdupq_n_u64(0);
-        {
-            uint64x2_t x0 = veorq_u64(vreinterpretq_u64_u8(s[0]), acc_run);
-
-            uint64x2_t t1 = vld1q_u64((uint64_t const*)g->H_refl[0]);
-            uint64x2_t t2 = vld1q_u64((uint64_t const*)(g->H_refl[0] + 16));
-            uint64x2_t t0 = veorq_u64(x0, swap64(x0));
-            acc1 = vreinterpretq_u64_p128(vmull_p64((poly64_t)vgetq_lane_u64(x0, 0),
-                                                    (poly64_t)vgetq_lane_u64(t1, 0)));
-            acc0 = vreinterpretq_u64_p128(vmull_p64((poly64_t)vgetq_lane_u64(x0, 1),
-                                                    (poly64_t)vgetq_lane_u64(t1, 1)));
-            accm = vreinterpretq_u64_p128(vmull_p64((poly64_t)vgetq_lane_u64(t0, 0),
-                                                    (poly64_t)vgetq_lane_u64(t2, 0)));
-        }
-
-        for (int i = 1; i <= 7; i++) {
-            uint64x2_t t1 = vld1q_u64((uint64_t const*)g->H_refl[i]);
-            uint64x2_t t2 = vld1q_u64((uint64_t const*)(g->H_refl[i] + 16));
-            mul_round(vreinterpretq_u64_u8(s[i]), t1, t2, &acc0, &acc1, &accm);
-        }
-
-        reduce_go(&acc0, &acc1, accm);
-        acc_run = acc0; /* keep in register for next iteration */
-
-        in += 128;
-        out += 128;
-    } /* while */
-    vst1q_u64((uint64_t*)g->X_refl, acc_run); /* store once after loop */
-}
-#endif
-
 static void gcm_crypt(CvmcryptGcm* g, u8 const* in, usize len, u8* out) {
-#if defined(__aarch64__)
-    /* Fast path: 4 blocks with parallel AES (pipelined vaeseq).
-     * gcm_crypt_4 has 11 round keys baked in, i.e. AES-128 only; AES-192/
-     * 256 fall through to the per-block loop below. */
-    while (len >= 64 && g->aes.rounds == 10) {
-        gcm_crypt_4(g, in, out);
-        in += 64;
-        out += 64;
-        len -= 64;
-    }
-#endif
+    /* Per-block GCTR: the arm64 bulk path is the adopted aesv8-gcm kernel,
+     * so this covers only the tail and the AES-192/256 fallback. */
     /* GCTR per SP 800-38D: the first block uses the counter as-is
      * (already set to ICB), subsequent blocks increment. */
     u8 block[16];
@@ -637,11 +258,6 @@ bool cvmcrypt_gcm_encrypt(CvmcryptGcm* g, u8 const* key, usize keylen, u8 const 
             g->X[i] ^= g->buf[i];
         }
         gf128_mul(g, g->X, g->H, g->X);
-#if defined(__aarch64__)
-        if (g->impl == CVMCRYPT_GCM_IMPL_PMULL) {
-            vst1q_u64((uint64_t*)g->X_refl, vrev64_ld(g->X));
-        }
-#endif
         g->buflen = 0;
     }
 
@@ -667,21 +283,6 @@ bool cvmcrypt_gcm_encrypt(CvmcryptGcm* g, u8 const* key, usize keylen, u8 const 
         if (ptlen > nblk) {
             gcm_crypt(g, pt + nblk, ptlen - nblk, ct + nblk);
             ghash_update(g, ct + nblk, ptlen - nblk, &g->ptlen);
-        }
-    } else if (0) {
-        /* Sync X → X_refl for the fused loop. */
-        vst1q_u64((uint64_t*)g->X_refl, vrev64_ld(g->X));
-        usize n128 = ptlen & ~(usize)127;
-        gcm_crypt_hash_loop(g, pt, ct, n128);
-        g->ptlen += n128 * 8;
-        /* Sync X_refl → X for the slow path and ghash_flush. */
-        vst1q_u8(g->X, vrev64q_u8(vreinterpretq_u8_u64(
-                           vld1q_u64((uint64_t const*)g->X_refl))));
-        /* Handle remainder with the non-fused path. */
-        usize rem = ptlen - n128;
-        gcm_crypt(g, pt + n128, rem, ct + n128);
-        if (rem > 0) {
-            ghash_update(g, ct + n128, rem, &g->ptlen);
         }
     } else
 #endif
@@ -726,11 +327,6 @@ bool cvmcrypt_gcm_decrypt(CvmcryptGcm* g, u8 const* key, usize keylen, u8 const 
             g->X[i] ^= g->buf[i];
         }
         gf128_mul(g, g->X, g->H, g->X);
-#if defined(__aarch64__)
-        if (g->impl == CVMCRYPT_GCM_IMPL_PMULL) {
-            vst1q_u64((uint64_t*)g->X_refl, vrev64_ld(g->X));
-        }
-#endif
         g->buflen = 0;
     }
 
