@@ -208,6 +208,54 @@ int main(int argc, char** argv) {
         printf("AES-128-GCM encrypt:  %8.1f MB/s\n", mbs);
     }
 
+    /* --- ChaCha20-Poly1305 encrypt (TLS 1.3 suite #2, used where AES
+     * hardware is absent) --- */
+    {
+        u8 key[32];
+        memset(key, 0xAB, 32);
+        u8 nonce[12];
+        memset(nonce, 0xCD, 12);
+        u8 tag[16];
+        double best = 1e9;
+        for (int r = 0; r < NUM_ROUNDS; r++) {
+            double t0 = now_ms();
+            for (usize off = 0; off < buf_size; off += 16384) {
+                usize chunk = 16384;
+                if (off + chunk > buf_size) chunk = buf_size - off;
+                cvmcrypt_chachapoly_encrypt(key, nonce, NULL, 0, data + off, chunk,
+                                            out + off, tag);
+            }
+            double t1 = now_ms();
+            if (t1 - t0 < best) best = t1 - t0;
+        }
+        printf("ChaCha20-Poly1305:    %8.1f MB/s\n", (double)buf_size / best / 1000.0);
+    }
+
+    /* --- AES-128-GCM decrypt --- */
+    {
+        u8 key[16];
+        memset(key, 0xAB, 16);
+        u8 iv[12];
+        memset(iv, 0xCD, 12);
+        u8 tag[16];
+        CvmcryptGcm gcm;
+        cvmcrypt_gcm_setup(&gcm, key, 16);
+        cvmcrypt_gcm_seal(&gcm, iv, NULL, 0, data, 16384, out, tag);
+
+        double best = 1e9;
+        for (int r = 0; r < NUM_ROUNDS; r++) {
+            double t0 = now_ms();
+            for (usize off = 0; off < buf_size; off += 16384) {
+                usize chunk = 16384;
+                if (off + chunk > buf_size) chunk = buf_size - off;
+                cvmcrypt_gcm_open(&gcm, iv, NULL, 0, out + off, chunk, data + off, tag);
+            }
+            double t1 = now_ms();
+            if (t1 - t0 < best) best = t1 - t0;
+        }
+        printf("AES-128-GCM decrypt: %8.1f MB/s\n", (double)buf_size / best / 1000.0);
+    }
+
     /* --- SHA-256 --- */
     {
         CvmcryptSha256 ctx;
