@@ -59,8 +59,8 @@ void cvm_tls_free(CvmTls* tls) {
 /* helper: derive traffic keys and set up protection                   */
 /* ------------------------------------------------------------------ */
 
-static int setup_traffic_protection(CvmTls* tls, bool is_enc, void const* secret,
-                                    char const* label) {
+static int setup_traffic_protection(CvmTls* tls, bool is_enc, u32 epoch,
+                                    void const* secret, char const* label) {
     CvmTlsAeadAlgo const* aead = tls->suite->aead;
     u8 key[32]; /* max AES-256 */
     u8 iv[TLS_MAX_IV_SIZE];
@@ -87,6 +87,26 @@ static int setup_traffic_protection(CvmTls* tls, bool is_enc, void const* secret
     memset(key, 0, sizeof(key));
     if (tp->aead == NULL)
         return TLS_ERROR_LIBRARY;
+
+    /*
+     * QUIC hook. Fires for every direction and level the moment the secret
+     * exists, which is what ngtcp2 needs: it derives packet protection from
+     * the secret itself (RFC 9001 §5.1 labels, not the record labels), so
+     * the key/iv computed above are for the record layer and go unused when
+     * the caller is QUIC.
+     */
+    if (tls->ctx->update_traffic_key != NULL &&
+        tls->ctx->update_traffic_key->cb != NULL) {
+        int cbret = tls->ctx->update_traffic_key->cb(tls->ctx->update_traffic_key, tls,
+                                                     is_enc, epoch, (u8 const*)secret,
+                                                     tls->suite->hash->digest_size);
+        if (cbret != 0)
+            return TLS_ALERT_INTERNAL_ERROR;
+    }
+
+    if (!is_enc)
+        tls->read_epoch = epoch;
+
     return 0;
 }
 
@@ -274,10 +294,11 @@ static int client_handle_server_hello(CvmTls* tls, CvmTlsBuf* sendbuf,
 #endif
 
     /* Set up record protection. */
-    ret = setup_traffic_protection(tls, false, tls->server_hs_secret, "s hs traffic");
+    ret =
+        setup_traffic_protection(tls, false, 2, tls->server_hs_secret, "s hs traffic");
     if (ret != 0)
         return ret;
-    ret = setup_traffic_protection(tls, true, tls->client_hs_secret, "c hs traffic");
+    ret = setup_traffic_protection(tls, true, 2, tls->client_hs_secret, "c hs traffic");
     if (ret != 0)
         return ret;
 
@@ -365,11 +386,11 @@ static int client_handle_message(CvmTls* tls, CvmTlsBuf* sendbuf, CvmTlsVec mess
                                                        "c ap traffic");
                 }
                 if (ret == 0) {
-                    ret = setup_traffic_protection(tls, false, tls->server_ap_secret,
+                    ret = setup_traffic_protection(tls, false, 3, tls->server_ap_secret,
                                                    "s ap traffic");
                     if (ret == 0)
-                        ret = setup_traffic_protection(tls, true, tls->client_ap_secret,
-                                                       "c ap traffic");
+                        ret = setup_traffic_protection(
+                            tls, true, 3, tls->client_ap_secret, "c ap traffic");
                 }
                 if (ret == 0) {
                     tls->state = TLS_STATE_CLIENT_POST_HANDSHAKE;
@@ -581,6 +602,10 @@ char const* cvm_tls_get_server_name(CvmTls const* tls) {
 }
 CvmTlsCipherSuite const* cvm_tls_get_cipher_suite(CvmTls const* tls) {
     return tls->suite;
+}
+
+u32 cvm_tls_get_read_epoch(CvmTls const* tls) {
+    return tls->read_epoch;
 }
 
 int cvm_tls_handle_message(CvmTls* tls, CvmTlsBuf* sendbuf, usize epoch_offsets[5],

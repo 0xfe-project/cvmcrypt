@@ -327,6 +327,26 @@ typedef struct CvmTlsSaveTicket {
 /* context                                                              */
 /* ------------------------------------------------------------------ */
 
+/*
+ * Traffic key callback (QUIC).
+ *
+ * Called once per direction per encryption level, at the moment the secret
+ * becomes available — not after the handshake, because QUIC needs the
+ * handshake keys to read Handshake packets long before the handshake ends.
+ *
+ * The callback receives the *secret*, not a derived key/iv: QUIC derives
+ * packet protection keys, IV and header-protection key itself with its own
+ * HKDF labels (RFC 9001 §5.1), which are not the TLS record labels.
+ *
+ * epoch follows TLS 1.3 / QUIC numbering: 0 initial, 1 0-RTT, 2 handshake,
+ * 3 1-RTT. Epoch 0 never fires — QUIC derives the initial secrets from the
+ * connection ID before TLS is involved.
+ */
+typedef struct CvmTlsTrafficKey {
+    int (*cb)(struct CvmTlsTrafficKey* self, CvmTls* tls, bool is_enc, u32 epoch,
+              u8 const* secret, usize secret_len);
+} CvmTlsTrafficKey;
+
 typedef struct CvmTlsContext {
     CvmTlsCipherSuite const* const* cipher_suites; /* NULL-terminated */
     CvmTlsKeyexAlgo const** key_exchanges;         /* NULL-terminated */
@@ -337,6 +357,8 @@ typedef struct CvmTlsContext {
         CvmTlsGetTime* get_time;
         CvmTlsRandomBytes* random_bytes;
         CvmTlsSaveTicket* save_ticket;
+        /* QUIC only: keys are handed out here instead of being installed. */
+        CvmTlsTrafficKey* update_traffic_key;
         /* server */
         CvmTlsCert* certificates; /* NULL-terminated array */
         u32 ticket_lifetime;      /* seconds; 0 = no tickets */
@@ -382,6 +404,11 @@ typedef struct CvmTlsHandshakeProps {
 /* public API                                                           */
 /* ------------------------------------------------------------------ */
 
+/* Fill a context with cvmcrypt's own crypto backends (AES-GCM/ChaCha20,
+ * SHA-256/384, X25519/P-256) and no certificates or callbacks. Defined in
+ * crypto_cvm.c. */
+void cvm_tls_context_defaults(CvmTlsContext* ctx);
+
 /* Lifecycle. */
 CvmTls* cvm_tls_new(CvmTlsContext const* ctx, bool is_server, char const* server_name);
 void cvm_tls_free(CvmTls* tls);
@@ -407,6 +434,13 @@ int cvm_tls_send_alert(CvmTls* tls, CvmTlsBuf* sendbuf, u8 level, u8 description
 int cvm_tls_handle_message(CvmTls* tls, CvmTlsBuf* sendbuf, usize epoch_offsets[5],
                            usize in_epoch, void const* input, usize inlen,
                            CvmTlsHandshakeProps* props);
+
+/*
+ * Highest encryption level whose receive keys are installed: 0 before any,
+ * 2 after ServerHello, 3 after Finished. QUIC uses this to decide which
+ * level the next CRYPTO frame belongs to.
+ */
+u32 cvm_tls_get_read_epoch(CvmTls const* tls);
 
 /* Accessors. */
 bool cvm_tls_is_server(CvmTls const* tls);

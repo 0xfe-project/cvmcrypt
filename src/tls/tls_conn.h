@@ -43,6 +43,9 @@ struct CvmTls {
     CvmTlsTrafficProt enc;
     CvmTlsTrafficProt dec;
 
+    /* Highest level with receive keys installed; see cvm_tls_get_read_epoch. */
+    u32 read_epoch;
+
     /* Received server certificate (DER). */
     CvmTlsCertEntry certs[4];
     usize num_certs;

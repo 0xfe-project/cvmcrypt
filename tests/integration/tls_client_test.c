@@ -99,6 +99,37 @@ static int tcp_connect(char const* host, int port) {
 }
 
 /* ------------------------------------------------------------------ */
+/* traffic key hook (QUIC surface)                                      */
+/* ------------------------------------------------------------------ */
+
+/*
+ * The callback ngtcp2 installs. Wired here so the interop run proves it
+ * fires where QUIC needs it: four times, handshake and application, one per
+ * direction, with the secret length the suite's hash implies.
+ */
+static int traffic_key_count;
+static u32 traffic_key_epochs[8];
+static int traffic_key_enc[8];
+static usize traffic_key_lens[8];
+
+static int on_traffic_key(struct CvmTlsTrafficKey* self, CvmTls* tls, bool is_enc,
+                          u32 epoch, u8 const* secret, usize secret_len) {
+    (void)self;
+    (void)tls;
+    if (traffic_key_count < 8) {
+        traffic_key_epochs[traffic_key_count] = epoch;
+        traffic_key_enc[traffic_key_count] = is_enc ? 1 : 0;
+        traffic_key_lens[traffic_key_count] = secret_len;
+    }
+    traffic_key_count++;
+    printf("[key] epoch=%u %s secret_len=%zu first=%02x%02x\n", epoch,
+           is_enc ? "tx" : "rx", secret_len, secret[0], secret[1]);
+    return 0;
+}
+
+static CvmTlsTrafficKey const traffic_key_hook = {.cb = on_traffic_key};
+
+/* ------------------------------------------------------------------ */
 /* main                                                                 */
 /* ------------------------------------------------------------------ */
 
@@ -121,6 +152,7 @@ int main(int argc, char** argv) {
     cvm_tls_context_defaults(&ctx);
     ctx.get_time = (CvmTlsGetTime*)&HOST_TIME;
     ctx.random_bytes = (CvmTlsRandomBytes*)&HOST_RANDOM;
+    ctx.update_traffic_key = (CvmTlsTrafficKey*)&traffic_key_hook;
 
     CvmTls* tls = cvm_tls_new(&ctx, false, host);
     if (!tls) {
@@ -216,10 +248,42 @@ int main(int argc, char** argv) {
         printf("[!] Handshake did not complete (state=%d)\n", tls->state);
     }
 
+    /*
+     * The QUIC surface, checked while the session is still alive: cvm_tls_free
+     * zeroises the struct, so anything read after it is a zero, not a result.
+     */
+    printf("[read epoch] %u\n", (unsigned)cvm_tls_get_read_epoch(tls));
+
+    int verdict = 0;
+    if (traffic_key_count != 4) {
+        fprintf(stderr, "FAIL: traffic key callback fired %d times, want 4\n",
+                traffic_key_count);
+        verdict = 1;
+    }
+    if (cvm_tls_get_read_epoch(tls) != 3) {
+        fprintf(stderr, "FAIL: read epoch %u after handshake, want 3\n",
+                (unsigned)cvm_tls_get_read_epoch(tls));
+        verdict = 1;
+    }
+    for (int i = 0; i < 4 && i < traffic_key_count; i++) {
+        u32 const want = i < 2 ? 2 : 3;
+        if (traffic_key_epochs[i] != want) {
+            fprintf(stderr, "FAIL: callback %d epoch %u, want %u\n", i,
+                    (unsigned)traffic_key_epochs[i], (unsigned)want);
+            verdict = 1;
+        }
+    }
+    if (verdict == 0) {
+        printf("traffic keys: 4 events, epochs 2,2,3,3, read epoch 3\n");
+    }
+
     /* Cleanup. */
     cvm_tls_buf_dispose(&sendbuf);
     cvm_tls_free(tls);
     close(fd);
+    if (verdict != 0) {
+        return 1;
+    }
     printf("=== done ===\n");
     return 0;
 }
