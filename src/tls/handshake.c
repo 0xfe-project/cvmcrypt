@@ -445,18 +445,20 @@ int cvm_tls_encode_encrypted_extensions(CvmTlsBuf* buf, CvmTlsVec* alpn_protocol
     if ((ret = push_block16(buf, &ext_start)) != 0)
         return ret;
 
-    /* ALPN — extension 16. */
+    /* ALPN — extension 16. ProtocolName is opaque<1..255>: a one-byte length,
+     * not two. The two-byte form parses as garbage and a client rejects the
+     * whole handshake with decode_error. */
     if (alpn_protocol != NULL && alpn_protocol->base != NULL) {
         usize alpn_start, list_start;
         if ((ret = cvm_tls_buf_push(buf, 0)) != 0)
             return ret;
-        if ((ret = cvm_tls_buf_push(buf, 16)) != 0)
+        if ((ret = cvm_tls_buf_push(buf, TLS_EXTENSION_TYPE_ALPN)) != 0)
             return ret;
         if ((ret = push_block16(buf, &alpn_start)) != 0)
             return ret;
         if ((ret = push_block16(buf, &list_start)) != 0)
             return ret;
-        if ((ret = push_vec16(buf, *alpn_protocol)) != 0)
+        if ((ret = push_vec8(buf, *alpn_protocol)) != 0)
             return ret;
         fix_block16(buf, list_start);
         fix_block16(buf, alpn_start);

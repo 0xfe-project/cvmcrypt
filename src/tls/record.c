@@ -278,6 +278,24 @@ int cvm_tls_encrypt_record(CvmTlsBuf* buf, usize rec_start, CvmTlsTrafficProt* e
  * CRYPTO frames. epoch_offsets[k] is the END offset of epoch k-1, so the
  * range for epoch e is [offsets[e], offsets[e+1]).
  */
+/*
+ * Tell a QUIC caller that a traffic secret exists. Lifted out of client.c so
+ * the server cannot forget it — which it did: the server set up its record
+ * protection inline in four places and never fired this hook, so ngtcp2 had no
+ * packet protection keys and silently never sent the Handshake flight.
+ */
+int cvm_tls_notify_traffic_key(CvmTls* tls, bool is_enc, u32 epoch,
+                               void const* secret) {
+    if (tls->ctx->update_traffic_key == NULL ||
+        tls->ctx->update_traffic_key->cb == NULL)
+        return 0;
+
+    int const cbret = tls->ctx->update_traffic_key->cb(
+        tls->ctx->update_traffic_key, tls, is_enc, epoch, (u8 const*)secret,
+        tls->suite->hash->digest_size);
+    return cbret != 0 ? TLS_ALERT_INTERNAL_ERROR : 0;
+}
+
 void cvm_tls_quic_note_emit(CvmTls* tls, CvmTlsBuf* buf, usize start) {
     (void)start;
     if (!tls->quic || tls->epoch_offsets == NULL)

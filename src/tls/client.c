@@ -119,13 +119,10 @@ static int setup_traffic_protection(CvmTls* tls, bool is_enc, u32 epoch,
      * the key/iv computed above are for the record layer and go unused when
      * the caller is QUIC.
      */
-    if (tls->ctx->update_traffic_key != NULL &&
-        tls->ctx->update_traffic_key->cb != NULL) {
-        int cbret = tls->ctx->update_traffic_key->cb(tls->ctx->update_traffic_key, tls,
-                                                     is_enc, epoch, (u8 const*)secret,
-                                                     tls->suite->hash->digest_size);
+    {
+        int const cbret = cvm_tls_notify_traffic_key(tls, is_enc, epoch, secret);
         if (cbret != 0)
-            return TLS_ALERT_INTERNAL_ERROR;
+            return cbret;
     }
 
     if (!is_enc)

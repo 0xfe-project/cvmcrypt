@@ -281,6 +281,9 @@ static int server_handle_client_hello(CvmTls* tls, CvmTlsBuf* sendbuf,
             ret = TLS_ERROR_LIBRARY;
             goto fail;
         }
+        ret = cvm_tls_notify_traffic_key(tls, true, 2, server_hs_secret);
+        if (ret != 0)
+            goto fail;
 
         ret = cvm_tls_ks_get_traffic_keys(&tls->ks, key, aead->key_size, iv,
                                           aead->iv_size, client_hs_secret);
@@ -293,6 +296,9 @@ static int server_handle_client_hello(CvmTls* tls, CvmTlsBuf* sendbuf,
             ret = TLS_ERROR_LIBRARY;
             goto fail;
         }
+        ret = cvm_tls_notify_traffic_key(tls, false, 2, client_hs_secret);
+        if (ret != 0)
+            goto fail;
 
         memset(key, 0, sizeof(key));
     }
@@ -482,6 +488,9 @@ static int server_handle_finished(CvmTls* tls, CvmTlsVec message) {
         tls->enc.seq = 0;
         if (tls->enc.aead == NULL)
             return TLS_ERROR_LIBRARY;
+        ret = cvm_tls_notify_traffic_key(tls, true, 3, tls->server_ap_secret);
+        if (ret != 0)
+            return ret;
 
         ret = cvm_tls_ks_get_traffic_keys(&tls->ks, key, aead->key_size, iv,
                                           aead->iv_size, tls->client_ap_secret);
@@ -492,6 +501,9 @@ static int server_handle_finished(CvmTls* tls, CvmTlsVec message) {
         tls->dec.seq = 0;
         if (tls->dec.aead == NULL)
             return TLS_ERROR_LIBRARY;
+        ret = cvm_tls_notify_traffic_key(tls, false, 3, tls->client_ap_secret);
+        if (ret != 0)
+            return ret;
 
         memset(key, 0, sizeof(key));
     }

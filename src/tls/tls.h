@@ -169,6 +169,10 @@ typedef struct CvmTls CvmTls; /* opaque */
  * emitters so the two cannot drift. */
 void cvm_tls_quic_note_emit(CvmTls* tls, CvmTlsBuf* buf, usize start);
 
+/* Fire the caller's traffic-key hook for one direction and level. No-op when
+ * the caller is not QUIC. Returns 0 or an alert to send. */
+int cvm_tls_notify_traffic_key(CvmTls* tls, bool is_enc, u32 epoch, void const* secret);
+
 void cvm_tls_buf_init(CvmTlsBuf* buf, u8* small, usize small_capacity);
 int cvm_tls_buf_reserve(CvmTlsBuf* buf, usize delta);
 int cvm_tls_buf_pushv(CvmTlsBuf* buf, void const* src, usize len);
