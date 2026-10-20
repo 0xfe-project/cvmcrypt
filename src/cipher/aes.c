@@ -354,7 +354,11 @@ void cvmcrypt_aes_decrypt_block(CvmcryptAesKey const* key, u8 const in[16],
 
 /* Reverse the bytes within each 32-bit word: our enc[] holds the FIPS
  * words as host u32, AES-NI wants them as the FIPS byte string. */
-static inline __m128i aes_ni_rk(u32 const* w) {
+/* The target attribute is required here, not decorative: GCC refuses to
+ * inline an always_inline intrinsic helper into a targeted function when the
+ * helper itself is not targeted ("target specific option mismatch"). Clang
+ * inlines it anyway, so this only shows up on a GCC x86_64 build. */
+__attribute__((target("aes,ssse3"))) static inline __m128i aes_ni_rk(u32 const* w) {
     __m128i v = _mm_loadu_si128((__m128i const*)w);
     __m128i m = _mm_setr_epi8(3, 2, 1, 0, 7, 6, 5, 4, 11, 10, 9, 8, 15, 14, 13, 12);
     return _mm_shuffle_epi8(v, m);
