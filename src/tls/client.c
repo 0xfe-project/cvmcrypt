@@ -64,29 +64,6 @@ void cvm_tls_free(CvmTls* tls) {
 /* helper: emit a handshake message                                    */
 /* ------------------------------------------------------------------ */
 
-/*
- * In QUIC mode a handshake message is not a record: it is a plaintext blob
- * tagged with the encryption level it belongs to, and the caller wraps it in
- * CRYPTO frames. epoch_offsets[k] is the END offset of epoch k-1, so the
- * range for epoch e is [offsets[e], offsets[e+1]).
- */
-static void quic_note_emit(CvmTls* tls, CvmTlsBuf* buf, usize start) {
-    (void)start;
-    if (!tls->quic || tls->epoch_offsets == NULL)
-        return;
-
-    /*
-     * Every boundary at or above this level moves to the current end. Leaving
-     * the higher ones at zero makes the caller compute `0 - offset` for the
-     * empty levels, which underflows to SIZE_MAX and looks like a gigantic
-     * epoch. Levels emitted later overwrite the ones above them, so the
-     * ordering still yields contiguous ranges.
-     */
-    for (usize e = tls->write_epoch + 1; e < 5; e++) {
-        tls->epoch_offsets[e] = buf->off;
-    }
-}
-
 static int emit_handshake(CvmTls* tls, CvmTlsBuf* sendbuf, u8 const* msg, usize len) {
     usize const start = sendbuf->off;
     int ret;
@@ -94,7 +71,7 @@ static int emit_handshake(CvmTls* tls, CvmTlsBuf* sendbuf, u8 const* msg, usize 
     if (tls->quic) {
         if ((ret = cvm_tls_buf_pushv(sendbuf, msg, len)) != 0)
             return ret;
-        quic_note_emit(tls, sendbuf, start);
+        cvm_tls_quic_note_emit(tls, sendbuf, start);
         return 0;
     }
 
@@ -216,7 +193,7 @@ static int client_send_client_hello(CvmTls* tls, CvmTlsBuf* sendbuf) {
 
     if (tls->quic) {
         tls->write_epoch = 0;
-        quic_note_emit(tls, sendbuf, rec_start);
+        cvm_tls_quic_note_emit(tls, sendbuf, rec_start);
     } else {
         sendbuf->base[rec_start + 3] = (u8)(body_len >> 8);
         sendbuf->base[rec_start + 4] = (u8)body_len;

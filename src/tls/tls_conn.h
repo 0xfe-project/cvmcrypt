@@ -62,6 +62,8 @@ struct CvmTls {
     usize local_quic_params_len;
     /* ALPN protocols offered in ClientHello, owned by the caller. */
     CvmTlsVec const* alpns;
+    /* The protocol this handshake settled on; empty when none was offered. */
+    CvmTlsVec negotiated_alpn;
     usize nalpn;
     /* Peer's transport parameters, copied out of EncryptedExtensions. */
     u8 remote_quic_params[TLS_MAX_QUIC_PARAMS_SIZE];

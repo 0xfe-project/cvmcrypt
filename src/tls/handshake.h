@@ -41,6 +41,14 @@ typedef struct CvmTlsClientHello {
     usize num_key_shares;
     u16 negotiated_version; /* from supported_versions ext */
 
+    /* quic_transport_parameters (extension 0x39), verbatim; empty when the
+     * client is not using QUIC. Points into the message, not owned. */
+    CvmTlsVec quic_params;
+
+    /* ALPN extension body (u16 list length + length-prefixed names), verbatim.
+     * A QUIC server must pick one and echo it; a TLS server may ignore it. */
+    CvmTlsVec alpn_list;
+
     /* Raw message (including header) for transcript hash. */
     CvmTlsVec raw;
 } CvmTlsClientHello;
@@ -115,7 +123,8 @@ int cvm_tls_encode_server_hello(CvmTlsBuf* buf, CvmTlsCipherSuite const* suite,
                                 CvmTlsKeyexAlgo const* keyex, CvmTlsVec peer_key);
 
 /* Build EncryptedExtensions (minimal: just ALPN + supported_groups). */
-int cvm_tls_encode_encrypted_extensions(CvmTlsBuf* buf, CvmTlsVec* alpn_protocol);
+int cvm_tls_encode_encrypted_extensions(CvmTlsBuf* buf, CvmTlsVec* alpn_protocol,
+                                        CvmTlsVec quic_params);
 
 /* Build a Certificate message. */
 int cvm_tls_encode_certificate(CvmTlsBuf* buf, CvmTlsVec const* certs, usize num_certs);

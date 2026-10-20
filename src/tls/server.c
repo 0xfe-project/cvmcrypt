@@ -26,10 +26,20 @@ extern void rt_mem_free(void* p);
 /* helper: emit a handshake record                                      */
 /* ------------------------------------------------------------------ */
 
-/* Write a record header + handshake message (unencrypted). */
-static int push_handshake_record(CvmTlsBuf* sendbuf, CvmTlsVec message) {
+/* Write a record header + handshake message (unencrypted). In QUIC mode the
+ * message is written bare at the Initial level instead — ServerHello is the
+ * only thing this function ever carries, so the level is fixed. */
+static int push_handshake_record(CvmTls* tls, CvmTlsBuf* sendbuf, CvmTlsVec message) {
     int ret;
     usize rec_start = sendbuf->off;
+
+    if (tls->quic) {
+        if ((ret = cvm_tls_buf_pushv(sendbuf, message.base, message.len)) != 0)
+            return ret;
+        tls->write_epoch = 0;
+        cvm_tls_quic_note_emit(tls, sendbuf, rec_start);
+        return 0;
+    }
     if ((ret = cvm_tls_buf_push(sendbuf, TLS_CONTENT_TYPE_HANDSHAKE)) != 0)
         return ret;
     if ((ret = cvm_tls_buf_push(sendbuf, 3)) != 0)
@@ -54,9 +64,18 @@ static int push_encrypted_message(CvmTls* tls, CvmTlsBuf* sendbuf, u8* msg,
     /* Feed into transcript first. */
     cvm_tls_ks_update_hash(&tls->ks, msg, msg_len);
 
-    /* Encrypt as a single record. */
     int ret;
     usize rec_start = sendbuf->off;
+
+    /* QUIC: no record, no AEAD here — the message is written bare at the
+     * Handshake level and ngtcp2 does the packet protection. */
+    if (tls->quic) {
+        if ((ret = cvm_tls_buf_pushv(sendbuf, msg, msg_len)) != 0)
+            return ret;
+        tls->write_epoch = 2;
+        cvm_tls_quic_note_emit(tls, sendbuf, rec_start);
+        return 0;
+    }
     if ((ret = cvm_tls_buf_push(sendbuf, TLS_CONTENT_TYPE_HANDSHAKE)) != 0)
         return ret;
     if ((ret = cvm_tls_buf_push(sendbuf, 3)) != 0)
@@ -107,6 +126,51 @@ static int server_handle_client_hello(CvmTls* tls, CvmTlsBuf* sendbuf,
     }
     if (tls->suite == NULL)
         return TLS_ALERT_HANDSHAKE_FAILURE;
+
+    /* ALPN: pick the first protocol the client offered that we also speak.
+     * The list is the same shape the client encoder writes — u16 total length,
+     * then vec8 names — so it is walked the same way. */
+    tls->negotiated_alpn = (CvmTlsVec){NULL, 0};
+    if (tls->alpns != NULL && ch.alpn_list.base != NULL) {
+        u8 const* p = ch.alpn_list.base;
+        u8 const* end = p + ch.alpn_list.len;
+        if (end - p >= 2) {
+            u16 list_len = (u16)(((u16)p[0] << 8) | p[1]);
+            p += 2;
+            if ((usize)(end - p) > list_len)
+                end = p + list_len;
+            while (p < end) {
+                u8 nlen = *p++;
+                if (p + nlen > end)
+                    break;
+                /* Bounded by nalpn, not by a NULL terminator: the caller's
+                 * array is a count, not a sentinel list. */
+                for (usize i = 0; i < tls->nalpn; i++) {
+                    if (tls->alpns[i].len == nlen &&
+                        memcmp(tls->alpns[i].base, p, nlen) == 0) {
+                        tls->negotiated_alpn = (CvmTlsVec){p, nlen};
+                        break;
+                    }
+                }
+                if (tls->negotiated_alpn.base != NULL)
+                    break;
+                p += nlen;
+            }
+        }
+        /* A QUIC client and server must agree on a protocol; none in common
+         * means no_application_protocol. */
+        if (tls->quic && tls->negotiated_alpn.base == NULL)
+            return TLS_ALERT_NO_APPLICATION_PROTOCOL;
+    }
+
+    /* Keep the client's QUIC transport parameters verbatim; they are the QUIC
+     * layer's to decode. */
+    tls->remote_quic_params_len = 0;
+    if (ch.quic_params.len > 0 &&
+        ch.quic_params.len <= sizeof(tls->remote_quic_params)) {
+        memcpy(tls->remote_quic_params, ch.quic_params.base, ch.quic_params.len);
+        tls->remote_quic_params_len = ch.quic_params.len;
+    }
 
     /* Generate server random. */
     tls->ctx->random_bytes->cb(tls->ctx->random_bytes, tls->server_random,
@@ -161,7 +225,7 @@ static int server_handle_client_hello(CvmTls* tls, CvmTlsBuf* sendbuf,
         goto fail;
 
     /* Send ServerHello (plaintext). */
-    ret = push_handshake_record(sendbuf, (CvmTlsVec){sh_buf.base, sh_buf.off});
+    ret = push_handshake_record(tls, sendbuf, (CvmTlsVec){sh_buf.base, sh_buf.off});
     if (ret != 0)
         goto fail;
 
@@ -237,7 +301,9 @@ static int server_handle_client_hello(CvmTls* tls, CvmTlsBuf* sendbuf,
     {
         CvmTlsBuf ee_buf;
         cvm_tls_buf_init(&ee_buf, NULL, 0);
-        ret = cvm_tls_encode_encrypted_extensions(&ee_buf, NULL);
+        ret = cvm_tls_encode_encrypted_extensions(
+            &ee_buf, tls->negotiated_alpn.base != NULL ? &tls->negotiated_alpn : NULL,
+            (CvmTlsVec){tls->local_quic_params, tls->local_quic_params_len});
         if (ret != 0) {
             cvm_tls_buf_dispose(&ee_buf);
             goto fail;

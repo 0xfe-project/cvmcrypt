@@ -6,6 +6,7 @@
  */
 
 #include "tls/tls_internal.h"
+#include "tls/tls_conn.h"
 #include "base/mem.h"
 #include "base/secure.h"
 
@@ -269,4 +270,27 @@ int cvm_tls_encrypt_record(CvmTlsBuf* buf, usize rec_start, CvmTlsTrafficProt* e
 
     cvmcrypt_secure_free(tmp, bodylen);
     return ret;
+}
+
+/*
+ * In QUIC mode a handshake message is not a record: it is a plaintext blob
+ * tagged with the encryption level it belongs to, and the caller wraps it in
+ * CRYPTO frames. epoch_offsets[k] is the END offset of epoch k-1, so the
+ * range for epoch e is [offsets[e], offsets[e+1]).
+ */
+void cvm_tls_quic_note_emit(CvmTls* tls, CvmTlsBuf* buf, usize start) {
+    (void)start;
+    if (!tls->quic || tls->epoch_offsets == NULL)
+        return;
+
+    /*
+     * Every boundary at or above this level moves to the current end. Leaving
+     * the higher ones at zero makes the caller compute `0 - offset` for the
+     * empty levels, which underflows to SIZE_MAX and looks like a gigantic
+     * epoch. Levels emitted later overwrite the ones above them, so the
+     * ordering still yields contiguous ranges.
+     */
+    for (usize e = tls->write_epoch + 1; e < 5; e++) {
+        tls->epoch_offsets[e] = buf->off;
+    }
 }

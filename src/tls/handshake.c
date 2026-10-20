@@ -432,7 +432,8 @@ int cvm_tls_encode_server_hello(CvmTlsBuf* buf, CvmTlsCipherSuite const* suite,
 /* other message encodes                                                */
 /* ------------------------------------------------------------------ */
 
-int cvm_tls_encode_encrypted_extensions(CvmTlsBuf* buf, CvmTlsVec* alpn_protocol) {
+int cvm_tls_encode_encrypted_extensions(CvmTlsBuf* buf, CvmTlsVec* alpn_protocol,
+                                        CvmTlsVec quic_params) {
     int ret;
     usize hdr_start, ext_start;
 
@@ -459,6 +460,21 @@ int cvm_tls_encode_encrypted_extensions(CvmTlsBuf* buf, CvmTlsVec* alpn_protocol
             return ret;
         fix_block16(buf, list_start);
         fix_block16(buf, alpn_start);
+    }
+
+    /* quic_transport_parameters — extension 57 (0x39). Same wire shape as in
+     * the ClientHello encoder above; a QUIC peer aborts when it is missing. */
+    if (quic_params.base != NULL && quic_params.len > 0) {
+        usize qp_start;
+        if ((ret = cvm_tls_buf_push(buf, 0)) != 0)
+            return ret;
+        if ((ret = cvm_tls_buf_push(buf, 0x39)) != 0)
+            return ret;
+        if ((ret = push_block16(buf, &qp_start)) != 0)
+            return ret;
+        if ((ret = cvm_tls_buf_pushv(buf, quic_params.base, quic_params.len)) != 0)
+            return ret;
+        fix_block16(buf, qp_start);
     }
 
     fix_block16(buf, ext_start);
@@ -663,6 +679,16 @@ int cvm_tls_decode_client_hello(CvmTlsClientHello* ch, u8 const* src, u8 const* 
             }
             break;
         }
+        case TLS_EXTENSION_TYPE_ALPN:
+            ch->alpn_list.base = (u8*)eb;
+            ch->alpn_list.len = ext_len;
+            break;
+        case TLS_EXTENSION_TYPE_QUIC_TRANSPORT_PARAMETERS:
+            /* Kept verbatim: they are opaque to TLS and decoded by the QUIC
+             * layer, which is the only thing that knows their layout. */
+            ch->quic_params.base = (u8*)eb;
+            ch->quic_params.len = ext_len;
+            break;
         case TLS_EXTENSION_TYPE_KEY_SHARE: {
             u16 ks_list_len;
             if (tls_decode16(&ks_list_len, &eb, eb_end) == 0) {

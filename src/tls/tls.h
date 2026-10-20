@@ -62,9 +62,10 @@ extern "C" {
 #define TLS_EXTENSION_TYPE_EARLY_DATA 42
 #define TLS_EXTENSION_TYPE_SUPPORTED_VERSIONS 43
 #define TLS_EXTENSION_TYPE_COOKIE 44
+#define TLS_EXTENSION_TYPE_KEY_SHARE 51
+#define TLS_EXTENSION_TYPE_QUIC_TRANSPORT_PARAMETERS 57
 #define TLS_EXTENSION_TYPE_PSK_KEY_EXCHANGE_MODES 45
 #define TLS_EXTENSION_TYPE_SIGNATURE_ALGORITHMS_CERT 50
-#define TLS_EXTENSION_TYPE_KEY_SHARE 51
 
 /* cipher suites (TLS 1.3 only) */
 #define TLS_CIPHER_SUITE_AES_128_GCM_SHA256 0x1301
@@ -155,6 +156,15 @@ typedef struct CvmTlsBuf {
     usize off;
     bool is_allocated;
 } CvmTlsBuf;
+
+typedef struct CvmTls CvmTls; /* opaque */
+
+/* In QUIC mode a handshake message is not a record: it is a plaintext blob
+ * tagged with the encryption level it belongs to, and the caller wraps it in
+ * CRYPTO frames. epoch_offsets[k] is the END offset of epoch k-1, so the range
+ * for epoch e is [offsets[e], offsets[e+1]). Shared by the client and server
+ * emitters so the two cannot drift. */
+void cvm_tls_quic_note_emit(CvmTls* tls, CvmTlsBuf* buf, usize start);
 
 void cvm_tls_buf_init(CvmTlsBuf* buf, u8* small, usize small_capacity);
 int cvm_tls_buf_reserve(CvmTlsBuf* buf, usize delta);
