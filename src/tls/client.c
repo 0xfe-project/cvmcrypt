@@ -125,9 +125,6 @@ static int setup_traffic_protection(CvmTls* tls, bool is_enc, u32 epoch,
             return cbret;
     }
 
-    if (!is_enc)
-        tls->read_epoch = epoch;
-
     return 0;
 }
 
