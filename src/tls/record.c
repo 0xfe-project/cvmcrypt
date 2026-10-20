@@ -286,6 +286,13 @@ int cvm_tls_encrypt_record(CvmTlsBuf* buf, usize rec_start, CvmTlsTrafficProt* e
  */
 int cvm_tls_notify_traffic_key(CvmTls* tls, bool is_enc, u32 epoch,
                                void const* secret) {
+    /* Bookkeeping first, whether or not there is a QUIC caller: the receive
+     * epoch is what cvm_tls_handle_message checks an incoming CRYPTO chunk
+     * against, and a server that never advances it rejects the client's
+     * Finished as an unexpected message. */
+    if (!is_enc)
+        tls->read_epoch = epoch;
+
     if (tls->ctx->update_traffic_key == NULL ||
         tls->ctx->update_traffic_key->cb == NULL)
         return 0;
