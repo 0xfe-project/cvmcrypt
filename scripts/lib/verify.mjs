@@ -74,6 +74,11 @@ function symbolsOf(nm, obj) {
         .split("\n")
         .map((l) => l.trim())
         .filter((l) => l.length > 0)
+        /* `nm -u` prints a bare name on macOS but "<addr> U <name>" on Linux,
+         * so the type letter stays glued to the symbol unless it is split off.
+         * With it attached no allowlist prefix ever matched and every
+         * legitimate cross-object reference was reported as a libc call. */
+        .map((l) => l.split(/\s+/).pop())
         .map(stripMachOSymbolNoise);
     return { undef };
 }

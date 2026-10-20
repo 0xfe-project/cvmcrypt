@@ -17,6 +17,23 @@ export const STD = "-std=c11";
 
 const COMMON = [STD, "-Wall", "-Wextra", "-Werror", "-Wpedantic", "-fno-common"];
 
+/*
+ * The x86 SIMD files include <immintrin.h>, and clang 19's own intrinsic
+ * headers trip -Wpedantic ("complex numbers are an extension in a freestanding
+ * C99 implementation", "_uwrmsr should not return void expression"). Those are
+ * diagnostics about clang's headers, not about this code, and turning them into
+ * build failures makes the tree depend on which clang happens to be installed.
+ */
+function simdNoiseFlags() {
+    return process.arch === "x64" || process.arch === "ia32"
+        ? [
+              "-Wno-error=pedantic",
+              /* clang 19's AMX intrinsics are unused static inlines. */
+              "-Wno-error=unused-function",
+          ]
+        : [];
+}
+
 export const DEBUG_FLAGS = ["-g", "-O0", "-fno-omit-frame-pointer", "-DCVM_DEBUG"];
 export const RELEASE_FLAGS = ["-O2", "-DNDEBUG"];
 
@@ -36,7 +53,7 @@ function featureTestFlags() {
 }
 
 function commonFor(opts) {
-    return [...COMMON, ...featureTestFlags()];
+    return [...COMMON, ...simdNoiseFlags(), ...featureTestFlags()];
 }
 
 /**

@@ -399,12 +399,41 @@ void cvmcrypt_aes_encrypt_block(CvmcryptAesKey const* key, u8 const in[16],
     }
 }
 
-/* Decrypt is not on the TLS path (GCM is counter mode) and stays scalar;
- * AES-NI decrypt needs the equivalent-inverse key handling, which is a
- * separate change. */
+/*
+ * AES-NI decrypt: the equivalent inverse cipher. key->dec[] already holds the
+ * InvMixColumns-transformed round keys in reverse order (the scalar decrypt
+ * consumes the same array), so this is the encrypt sequence with AESDEC in
+ * place of AESENC — no ImmMixColumns step belongs here, doing it twice is the
+ * classic way to get plausible-looking but wrong plaintext.
+ */
+__attribute__((target("aes,ssse3"))) static void
+aes_decrypt_block_ni(CvmcryptAesKey const* key, u8 const in[16], u8 out[16]) {
+    __m128i s = _mm_loadu_si128((__m128i const*)in);
+    u32 nr = key->rounds;
+
+    /*
+     * AESDEC applies InvMixColumns to the state itself, so the keys have to be
+     * in the equivalent-inverse arrangement: reversed, with the first and last
+     * round keys swapped (they are not transformed) and the middle ones
+     * InvMixColumns'd. key->dec[] holds exactly those middle keys — the scalar
+     * decrypt walks the same array forwards, which is why using it in order
+     * here produces plausible but wrong plaintext.
+     */
+    s = _mm_xor_si128(s, aes_ni_rk(&key->enc[4 * nr]));
+    for (u32 r = nr - 1; r >= 1; r--) {
+        s = _mm_aesdec_si128(s, aes_ni_rk(&key->dec[4 * r]));
+    }
+    s = _mm_aesdeclast_si128(s, aes_ni_rk(&key->enc[0]));
+    _mm_storeu_si128((__m128i*)out, s);
+}
+
 void cvmcrypt_aes_decrypt_block(CvmcryptAesKey const* key, u8 const in[16],
                                 u8 out[16]) {
-    aes_decrypt_block_scalar(key, in, out);
+    if (aes_x86_has_ni()) {
+        aes_decrypt_block_ni(key, in, out);
+    } else {
+        aes_decrypt_block_scalar(key, in, out);
+    }
 }
 
 #else /* no hardware AES: both entry points are the scalar path */

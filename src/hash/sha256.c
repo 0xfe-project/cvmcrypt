@@ -387,7 +387,26 @@ static u8 pick_impl(void) {
 #if defined(__aarch64__)
     return CVMCRYPT_SHA256_IMPL_ARM64;
 #elif defined(__x86_64__) || defined(_M_X64)
-    return shani_available() ? CVMCRYPT_SHA256_IMPL_SHANI : CVMCRYPT_SHA256_IMPL_SCALAR;
+#ifdef CVMCRYPT_SHA256_FORCE_SHANI
+    /* Test hook only, like CVMCRYPT_GCM_FORCE_ASM: Rosetta reports SHA-NI=0,
+     * so without this the path cannot be exercised on a development machine at
+     * all. Never define it in a shipped build. */
+    return CVMCRYPT_SHA256_IMPL_SHANI;
+#else
+    /*
+     * SHA-NI is available on this CPU and the translation below is wrong: all
+     * three NIST KATs fail, including the empty input. It produced wrong
+     * digests on the first real x86_64 machine the project ran on, and because
+     * TLS derives its keys through HKDF-SHA256 the peer saw it as "bad record
+     * MAC" on the very first encrypted record.
+     *
+     * Rosetta reports SHA-NI=0, so every local run — and every macOS run —
+     * took the scalar path and looked perfect. Correctness first: the scalar
+     * path is the one that is verified, so that is what ships until the
+     * translation is fixed (t62).
+     */
+    return CVMCRYPT_SHA256_IMPL_SCALAR;
+#endif
 #else
     return CVMCRYPT_SHA256_IMPL_SCALAR;
 #endif
