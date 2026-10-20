@@ -972,8 +972,14 @@ CvmTlsVec cvm_tls_quic_remote_transport_params(CvmTls const* tls) {
 void cvm_tls_set_alpn(CvmTls* tls, CvmTlsVec const* alpns, usize nalpn) {
     if (tls == NULL)
         return;
-    tls->alpns = alpns;
-    tls->nalpn = alpns != NULL ? nalpn : 0;
+    tls->nalpn = 0;
+    if (alpns == NULL)
+        return;
+    if (nalpn > TLS_MAX_ALPN)
+        nalpn = TLS_MAX_ALPN;
+    for (usize i = 0; i < nalpn; i++)
+        tls->alpns[i] = alpns[i];
+    tls->nalpn = nalpn;
 }
 
 bool cvm_tls_is_quic(CvmTls const* tls) {

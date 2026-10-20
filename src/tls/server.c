@@ -131,7 +131,7 @@ static int server_handle_client_hello(CvmTls* tls, CvmTlsBuf* sendbuf,
      * The list is the same shape the client encoder writes — u16 total length,
      * then vec8 names — so it is walked the same way. */
     tls->negotiated_alpn = (CvmTlsVec){NULL, 0};
-    if (tls->alpns != NULL && ch.alpn_list.base != NULL) {
+    if (tls->nalpn > 0 && ch.alpn_list.base != NULL) {
         u8 const* p = ch.alpn_list.base;
         u8 const* end = p + ch.alpn_list.len;
         if (end - p >= 2) {

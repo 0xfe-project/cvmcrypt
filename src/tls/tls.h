@@ -54,6 +54,9 @@ extern "C" {
 #define TLS_HANDSHAKE_TYPE_MESSAGE_HASH 254
 
 /* extensions (RFC 8446 §11) */
+/* How many ALPN protocols a single endpoint may offer. */
+#define TLS_MAX_ALPN 8
+
 #define TLS_EXTENSION_TYPE_SERVER_NAME 0
 #define TLS_EXTENSION_TYPE_SUPPORTED_GROUPS 10
 #define TLS_EXTENSION_TYPE_SIGNATURE_ALGORITHMS 13

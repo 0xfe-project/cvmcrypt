@@ -61,7 +61,11 @@ struct CvmTls {
     u8 local_quic_params[TLS_MAX_QUIC_PARAMS_SIZE];
     usize local_quic_params_len;
     /* ALPN protocols offered in ClientHello, owned by the caller. */
-    CvmTlsVec const* alpns;
+    /* Copied by cvm_tls_set_alpn, not referenced: callers pass compound
+     * literals and stack temporaries, and a stored pointer to those dangles
+     * the moment the call returns — which is exactly how the QUIC server ended
+     * up rejecting the only protocol it supports. */
+    CvmTlsVec alpns[TLS_MAX_ALPN];
     /* The protocol this handshake settled on; empty when none was offered. */
     CvmTlsVec negotiated_alpn;
     usize nalpn;
