@@ -36,7 +36,20 @@ function clean() {
 }
 
 function compileTree({ dir, flavor, toolchain, verbose }) {
-    const srcs = collect(dir, [".c", ".S"]);
+    /*
+     * Assembly is per-architecture and must not be assembled for the wrong
+     * one: `gcm_arm64.S` fails outright on an x86_64 assembler, and the other
+     * way round would silently produce nothing for the fast path. The file
+     * name is the contract — `_arm64` and `_amd64` are the only suffixes a
+     * file in this tree may carry.
+     */
+    const arch = process.arch;
+    const srcs = collect(dir, [".c", ".S"]).filter((f) => {
+        if (!f.endsWith(".S")) return true;
+        if (f.endsWith("_arm64.S")) return arch === "arm64";
+        if (f.endsWith("_amd64.S") || f.endsWith("_x86_64.S")) return arch === "x64";
+        return true;
+    });
     const objs = [];
 
     for (const src of srcs) {
