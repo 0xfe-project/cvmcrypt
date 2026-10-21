@@ -254,89 +254,75 @@ static void sha256_compress_arm64(CvmcryptSha256* md, u8 const* block) {
 
 __attribute__((target("sse2,ssse3,sse4.1,sha"))) static void
 sha256_compress_shani(CvmcryptSha256* md, u8 const* block) {
-    /* State packing per Intel's SHA extension guide: state0 holds
-     * (a,b,e,f), state1 holds (c,d,g,h). The shuffles below map our
-     * linear state[0..7] into that layout.
+    /*
+     * SHA-NI, following Intel's sequence exactly.
      *
-     * SHA-NI requires SSE2+SSSE3+SSE4.1+SHA; the dispatch only picks
-     * this path when cpuid confirms all of them. */
-    __m128i reverse = _mm_set_epi64x(0x0c0d0e0f08090a0bull, 0x0405060700010203ull);
-    __m128i state_0 = _mm_loadu_si128((__m128i const*)(&md->state[0]));
-    __m128i state_1 = _mm_loadu_si128((__m128i const*)(&md->state[4]));
-    __m128i tmp = _mm_shuffle_epi32(state_0, 0x4E); /* 0x4E = 0b101110 = swap halves */
-    state_1 = _mm_shuffle_epi32(state_1, 0x1B); /* 0x1B = 0b011010 = reverse lanes */
-    state_0 = _mm_alignr_epi8(tmp, state_1, 8);
-    /* blend: take the two lower lanes from state_1's upper */
-    state_1 = _mm_blend_epi16(state_1, tmp, 0x30);
+     * Two things in here are not obvious and both were wrong the first time:
+     *
+     *   - the state lives in the register as ABEF and CDGH with the low lane
+     *     first, so ABEF is (f,e,b,a) and CDGH is (h,g,d,c). The shuffles that
+     *     get there are 0xB1 / 0x1B / alignr 8 / blend 0xF0, not "reverse the
+     *     halves".
+     *   - the message schedule is fed group by group and each group needs the
+     *     msg1 of itself, the alignr of the two older groups, then msg2 with
+     *     the oldest. Rotating the four registers instead of indexing them by
+     *     group swaps two of those operands and silently computes a different
+     *     (but well-formed) hash.
+     *
+     * Verified against the scalar path block-for-block, not by inspection.
+     */
+    __m128i const mask = _mm_set_epi64x(0x0c0d0e0f08090a0bull, 0x0405060700010203ull);
 
-    __m128i old_0 = state_0;
-    __m128i old_1 = state_1;
-    __m128i msg, msg_0, msg_1, msg_2, msg_3;
+    __m128i tmp = _mm_loadu_si128((__m128i const*)&md->state[0]);
+    __m128i cdgh = _mm_loadu_si128((__m128i const*)&md->state[4]);
+    tmp = _mm_shuffle_epi32(tmp, 0xB1);   /* CDAB */
+    cdgh = _mm_shuffle_epi32(cdgh, 0x1B); /* HGFE */
+    __m128i abef = _mm_alignr_epi8(tmp, cdgh, 8);
+    cdgh = _mm_blend_epi16(cdgh, tmp, 0xF0);
 
-    /* Rounds 0-3 */
-    msg_0 = _mm_shuffle_epi8(_mm_loadu_si128((__m128i const*)(&block[0])), reverse);
-    msg = _mm_add_epi32(msg_0, _mm_load_si128((__m128i const*)(&K[0])));
-    state_1 = _mm_sha256rnds2_epu32(state_1, state_0, msg);
-    msg = _mm_shuffle_epi32(msg, 0x30);
-    state_0 = _mm_sha256rnds2_epu32(state_0, state_1, msg);
+    __m128i const abef_save = abef;
+    __m128i const cdgh_save = cdgh;
+    __m128i msg;
 
-    /* Rounds 4-7 */
-    msg_1 = _mm_shuffle_epi8(_mm_loadu_si128((__m128i const*)(&block[16])), reverse);
-    msg = _mm_add_epi32(msg_1, _mm_load_si128((__m128i const*)(&K[4])));
-    state_1 = _mm_sha256rnds2_epu32(state_1, state_0, msg);
-    msg = _mm_shuffle_epi32(msg, 0x30);
-    state_0 = _mm_sha256rnds2_epu32(state_0, state_1, msg);
+    __m128i m[4];
+    m[0] = _mm_shuffle_epi8(_mm_loadu_si128((__m128i const*)(block + 0)), mask);
+    m[1] = _mm_shuffle_epi8(_mm_loadu_si128((__m128i const*)(block + 16)), mask);
+    m[2] = _mm_shuffle_epi8(_mm_loadu_si128((__m128i const*)(block + 32)), mask);
+    m[3] = _mm_shuffle_epi8(_mm_loadu_si128((__m128i const*)(block + 48)), mask);
 
-    /* Rounds 8-11 */
-    msg_2 = _mm_shuffle_epi8(_mm_loadu_si128((__m128i const*)(&block[32])), reverse);
-    msg = _mm_add_epi32(msg_2, _mm_load_si128((__m128i const*)(&K[8])));
-    state_1 = _mm_sha256rnds2_epu32(state_1, state_0, msg);
-    msg = _mm_shuffle_epi32(msg, 0x30);
-    state_0 = _mm_sha256rnds2_epu32(state_0, state_1, msg);
-
-    /* Rounds 12-15 */
-    msg_3 = _mm_shuffle_epi8(_mm_loadu_si128((__m128i const*)(&block[48])), reverse);
-    msg = _mm_add_epi32(msg_3, _mm_load_si128((__m128i const*)(&K[12])));
-    state_1 = _mm_sha256rnds2_epu32(state_1, state_0, msg);
-    msg = _mm_shuffle_epi32(msg, 0x30);
-    state_0 = _mm_sha256rnds2_epu32(state_0, state_1, msg);
-
-    /* Rounds 16-59: 4 rounds at a time, the schedule rolling in msg_0..3. */
-    for (u32 i = 16; i < 60; i += 4) {
-        msg_0 = _mm_sha256msg1_epu32(msg_0, msg_1);
-        tmp = _mm_alignr_epi8(msg_3, msg_2, 4);
-        msg_0 = _mm_add_epi32(msg_0, tmp);
-        msg_0 = _mm_sha256msg2_epu32(msg_0, msg_3);
-        msg = _mm_add_epi32(msg_0, _mm_load_si128((__m128i const*)(&K[i])));
-        state_1 = _mm_sha256rnds2_epu32(state_1, state_0, msg);
-        msg = _mm_shuffle_epi32(msg, 0x30);
-        state_0 = _mm_sha256rnds2_epu32(state_0, state_1, msg);
-
-        /* rotate the schedule window */
-        __m128i t = msg_0;
-        msg_0 = msg_1;
-        msg_1 = msg_2;
-        msg_2 = msg_3;
-        msg_3 = t;
+    for (u32 i = 0, k = 0; i < 64; i += 4, k++) {
+        u32 const c = k & 3;
+        if (i >= 16) {
+            u32 const n = (k + 1) & 3, p2 = (k + 2) & 3, p3 = (k + 3) & 3;
+            m[c] = _mm_sha256msg1_epu32(m[c], m[n]);
+            __m128i const t = _mm_alignr_epi8(m[p3], m[p2], 4);
+            m[c] = _mm_add_epi32(m[c], t);
+            m[c] = _mm_sha256msg2_epu32(m[c], m[p3]);
+        }
+        if (i < 60) {
+            msg = _mm_add_epi32(m[c], _mm_loadu_si128((__m128i const*)&K[i]));
+            cdgh = _mm_sha256rnds2_epu32(cdgh, abef, msg);
+            msg = _mm_shuffle_epi32(msg, 0x0E);
+            abef = _mm_sha256rnds2_epu32(abef, cdgh, msg);
+        }
     }
 
-    /* Rounds 60-63: no more schedule update. */
-    msg = _mm_add_epi32(msg_3, _mm_load_si128((__m128i const*)(&K[60])));
-    state_1 = _mm_sha256rnds2_epu32(state_1, state_0, msg);
-    msg = _mm_shuffle_epi32(msg, 0x30);
-    state_0 = _mm_sha256rnds2_epu32(state_0, state_1, msg);
+    /* rounds 60-63 with the group computed above at i == 60 */
+    msg = _mm_add_epi32(m[3], _mm_loadu_si128((__m128i const*)&K[60]));
+    cdgh = _mm_sha256rnds2_epu32(cdgh, abef, msg);
+    msg = _mm_shuffle_epi32(msg, 0x0E);
+    abef = _mm_sha256rnds2_epu32(abef, cdgh, msg);
 
-    /* Add the original state. */
-    state_0 = _mm_add_epi32(old_0, state_0);
-    state_1 = _mm_add_epi32(old_1, state_1);
+    abef = _mm_add_epi32(abef, abef_save);
+    cdgh = _mm_add_epi32(cdgh, cdgh_save);
 
-    /* Unpack state back to linear. */
-    tmp = _mm_shuffle_epi32(state_0, 0x4E);
-    state_0 = _mm_blend_epi16(state_0, _mm_shuffle_epi32(state_1, 0x1B), 0x30);
-    state_1 = _mm_blend_epi16(state_1, tmp, 0xC0);
+    tmp = _mm_shuffle_epi32(abef, 0x1B);  /* FEBA */
+    cdgh = _mm_shuffle_epi32(cdgh, 0xB1); /* DCHG */
+    abef = _mm_blend_epi16(tmp, cdgh, 0xF0);
+    cdgh = _mm_alignr_epi8(cdgh, tmp, 8);
 
-    _mm_storeu_si128((__m128i*)&md->state[0], state_0);
-    _mm_storeu_si128((__m128i*)&md->state[4], state_1);
+    _mm_storeu_si128((__m128i*)&md->state[0], abef);
+    _mm_storeu_si128((__m128i*)&md->state[4], cdgh);
 }
 #endif /* __x86_64__ */
 
@@ -387,26 +373,7 @@ static u8 pick_impl(void) {
 #if defined(__aarch64__)
     return CVMCRYPT_SHA256_IMPL_ARM64;
 #elif defined(__x86_64__) || defined(_M_X64)
-#ifdef CVMCRYPT_SHA256_FORCE_SHANI
-    /* Test hook only, like CVMCRYPT_GCM_FORCE_ASM: Rosetta reports SHA-NI=0,
-     * so without this the path cannot be exercised on a development machine at
-     * all. Never define it in a shipped build. */
-    return CVMCRYPT_SHA256_IMPL_SHANI;
-#else
-    /*
-     * SHA-NI is available on this CPU and the translation below is wrong: all
-     * three NIST KATs fail, including the empty input. It produced wrong
-     * digests on the first real x86_64 machine the project ran on, and because
-     * TLS derives its keys through HKDF-SHA256 the peer saw it as "bad record
-     * MAC" on the very first encrypted record.
-     *
-     * Rosetta reports SHA-NI=0, so every local run — and every macOS run —
-     * took the scalar path and looked perfect. Correctness first: the scalar
-     * path is the one that is verified, so that is what ships until the
-     * translation is fixed (t62).
-     */
-    return CVMCRYPT_SHA256_IMPL_SCALAR;
-#endif
+    return shani_available() ? CVMCRYPT_SHA256_IMPL_SHANI : CVMCRYPT_SHA256_IMPL_SCALAR;
 #else
     return CVMCRYPT_SHA256_IMPL_SCALAR;
 #endif

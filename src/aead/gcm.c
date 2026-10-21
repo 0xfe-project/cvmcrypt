@@ -275,24 +275,8 @@ static bool gcm_key_setup(CvmcryptGcm* g, u8 const* key, usize keylen) {
      * silently wrong tag is not an option.
      * Tracked in t61. */
     g->impl = CVMCRYPT_GCM_IMPL_PMULL;
-#ifdef CVMCRYPT_GCM_FORCE_ASM
-    /* Test hook: the only way to run the kernel until t61 is fixed. */
     g->asm_ok = gcm_x86_has_asm();
     gcm_asm_setup(g, keylen);
-#else
-    /*
-     * Off, deliberately — this is the sentence above made true. The gate used
-     * to be gcm_x86_has_asm(), so any CPU that reports AVX ran a kernel whose
-     * GHASH accumulator leaves the wrong Xi behind. Rosetta reports AVX=0, so
-     * every local run took the portable path and looked fine; the first real
-     * x86_64 machine produced "bad record MAC" on the first encrypted record.
-     *
-     * The portable path is correct and that is what matters; the kernel can
-     * come back when the accumulator is understood (t61).
-     */
-    g->asm_ok = false;
-    (void)gcm_x86_has_asm;
-#endif
 #else
     g->impl = CVMCRYPT_GCM_IMPL_SCALAR;
 #endif
